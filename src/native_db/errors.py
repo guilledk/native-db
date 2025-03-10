@@ -1,0 +1,6 @@
+class NativeDBError(Exception):
+    ...
+
+
+class InvalidTableLayoutError(NativeDBError):
+    ...
