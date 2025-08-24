@@ -12,7 +12,7 @@ import polars as pl
 
 from polars.datatypes import TemporalType
 
-from native_db.dtypes import Keyword
+from native_db.dtypes import Keyword, Mono
 from native_db.errors import InvalidTableLayoutError
 from native_db.schema import Column, Schema
 
@@ -84,15 +84,12 @@ class MonoPartitioner(Partitioner):
         self.col = meta.column(table.schema)
         self.plcol = pl.col(self.col.name)
 
-        from native_db.dtypes import DataTypeMono
-
-        if not isinstance(self.col.type, DataTypeMono):
+        if not isinstance(self.col.type, Mono):
             raise InvalidTableLayoutError(
                 'Mono partitioner expected column type to be monotonic'
             )
 
         self._row_size = meta.row_size
-        self._allow_gaps = self.col.type.allow_gaps
 
     def prepare(self, staged: pl.LazyFrame) -> pl.LazyFrame:
         # map to buckets by fixed range size row_size

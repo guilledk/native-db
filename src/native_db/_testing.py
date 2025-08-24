@@ -6,7 +6,7 @@ from typing import Generator, Literal
 import polars as pl
 
 from native_db._utils import epoch
-from native_db.dtypes import Keyword, Mono32, Mono64, TypeHints
+from native_db.dtypes import Keyword, Mono, TypeHints
 from native_db.table import Table
 from native_db.table._layout import KeywordPartitionMeta, MonoPartitionMeta, TimePartitionMeta
 
@@ -15,7 +15,7 @@ block_table = Table(
     'block',
     'static/blocks',
     (
-        ('number', Mono32(allow_gaps=False), TypeHints(sort='asc')),
+        ('number', Mono(size=4), TypeHints(sort='asc')),
         ('timestamp', pl.Datetime(time_unit='us', time_zone='UTC')),
         ('hash', Keyword, TypeHints(avg_str_size=64)),
     ),
@@ -109,7 +109,7 @@ pubmed_table = Table(
     'pubmed',
     'static/pubmed',
     (
-        ('pmid', Mono64(allow_gaps=True), TypeHints(sort='asc')),
+        ('pmid', Mono(size=8), TypeHints(sort='asc')),
         ('pub_date', pl.Date),
         ('title', pl.String, TypeHints(avg_str_size=128)),
     ),
@@ -165,7 +165,7 @@ pubmed_author_table = Table(
     'static/pubmed_author',
     (
         ('name', Keyword),
-        ('pmid', Mono32(allow_gaps=True), TypeHints(sort='asc')),
+        ('pmid', Mono(size=8), TypeHints(sort='asc')),
     ),
     datadir=Path(__file__).parent.parent / 'tests/.test-db',
     partitioning=KeywordPartitionMeta(on_column='name', char_depth=1),

@@ -45,7 +45,7 @@ from typing import Any, Literal, TypeGuard
 import msgspec
 import polars as pl
 from polars.datatypes.classes import NumericType, classinstmethod
-from polars._typing import PythonDataType
+from polars._typing import PythonDataType, PolarsDataType
 
 
 class Keyword(pl.DataType):
@@ -63,50 +63,41 @@ class Keyword(pl.DataType):
         return pl.String
 
 
-class Mono(NumericType):
-    allow_gaps: bool
+IntegerSizes = Literal[4, 8, 16]
 
-    def __init__(self, allow_gaps: bool = True) -> None:
-        self.allow_gaps = allow_gaps
+
+class Mono(NumericType):
+    size: IntegerSizes
+
+    def __init__(self, size: IntegerSizes) -> None:
+        self.size = size
 
     @classinstmethod
     def to_python(cls) -> PythonDataType:
         return int
 
-    def __eq__(self, other: PolarsDataType) -> bool:  # type: ignore[override]
-        return (
-            type(self) == type(other)
-            and getattr(other, 'allow_gaps', None) == self.allow_gaps
-        )
+    def __eq__(self, other: PolarsDataType) -> bool:
+        return isinstance(other, Mono) and other.size == self.size
 
     def __hash__(self) -> int:
-        return hash((self.__class__, self.allow_gaps))
+        return hash((self.__class__, self.size))
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
-        return f'{class_name}(allow_gaps={self.allow_gaps})'
-
-
-class Mono32(Mono):
-    '''
-    For numeric columns which are monotonic (32 bit)
-
-    '''
+        return f'{class_name}(size={self.size})'
 
     @classinstmethod
     def fallback_type(cls) -> type[pl.DataType]:
-        return pl.UInt32
+        match cls.size:
+            case 4:
+                return pl.UInt32
 
+            case 8:
+                return pl.UInt64
 
-class Mono64(Mono):
-    '''
-    For numeric columns which are monotonic (32 bit)
+            case 16:
+                return pl.Int128
 
-    '''
-
-    @classinstmethod
-    def fallback_type(cls) -> type[pl.DataType]:
-        return pl.UInt64
 
 
 # type hints
@@ -117,11 +108,8 @@ SortTypes = Literal['asc', 'desc']
 # simple type kind distinction, can be used to infer settings
 TypeKind = Literal['numeric', 'string', 'nested']
 
-# only custom monotonic types
-DataTypeMono = Mono32 | Mono64
-
 # our custom extended types
-DataTypeCustom = type[Keyword] | DataTypeMono
+DataTypeCustom = type[Keyword] | Mono
 
 # all types, polars std + our custom types
 DataTypeExt = type[pl.DataType] | pl.DataType | DataTypeCustom
@@ -130,7 +118,7 @@ DataTypeExt = type[pl.DataType] | pl.DataType | DataTypeCustom
 # type sets
 
 # custom types that are fixed size
-custom_types_fixed_size: tuple[type[pl.DataType], ...] = (Mono32, Mono64)
+custom_types_fixed_size: tuple[type[pl.DataType], ...] = (Mono, )
 
 # all custom types
 custom_types: tuple[type[pl.DataType], ...] = (
@@ -344,8 +332,7 @@ DTypeTag = Literal[
     'binary',
     'string',  # polars string
     'keyword',  # custom Keyword
-    'mono32',
-    'mono64',  # custom Mono types
+    'mono', # custom monotonic
 ]
 
 # Maps between runtime dtype classes and tags
@@ -368,8 +355,7 @@ dtype_tag_map: dict[DataTypeExt, DTypeTag] = {
     pl.Binary: 'binary',
     pl.String: 'string',
     Keyword: 'keyword',
-    Mono32: 'mono32',
-    Mono64: 'mono64',
+    Mono: 'mono',
 }
 
 # inverse of dtype_tag_map
