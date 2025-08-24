@@ -2,6 +2,7 @@
 Misc internal utilities
 
 '''
+
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -108,5 +109,4 @@ def fetch_remote_file(
     return url, local_path
 
 
-class NativeDBWarning(Warning):
-    ...
+class NativeDBWarning(Warning): ...

@@ -13,7 +13,6 @@ from native_db.dtypes import (
     TypeHints,
     TypeKind,
     avg_type_size,
-    custom_types,
     is_custom_type,
     py_type_for,
     should_use_dictionary,
@@ -70,12 +69,15 @@ class Column(msgspec.Struct, dict=True, frozen=True):
         return ColumnMeta(
             name=self.name,
             type=DataTypeMeta.from_dtype(self.type),
-            hints=self.hints
+            hints=self.hints,
         )
 
 
 ColumnLike = (
-    tuple[str, DataTypeExt] | tuple[str, DataTypeExt, TypeHints] | ColumnMeta | Column
+    tuple[str, DataTypeExt]
+    | tuple[str, DataTypeExt, TypeHints]
+    | ColumnMeta
+    | Column
 )
 
 
@@ -105,7 +107,9 @@ class Schema:
             if target_group_size <= 0:
                 raise ValueError(f'target_group_size needs to be > 0')
 
-            self._row_group_size = max(1, target_group_size // self.avg_row_size)
+            self._row_group_size = max(
+                1, target_group_size // self.avg_row_size
+            )
 
     @staticmethod
     def from_like(s: SchemaLike) -> Schema:
@@ -183,11 +187,8 @@ class Schema:
 
     def encode(self) -> SchemaMeta:
         return SchemaMeta(
-            columns=[
-                col.encode()
-                for col in self._columns
-            ],
-            row_group_size=self._row_group_size
+            columns=[col.encode() for col in self._columns],
+            row_group_size=self._row_group_size,
         )
 
 

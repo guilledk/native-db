@@ -35,11 +35,12 @@ about the column outside the regular type system:
       inference).
 
 '''
+
 from __future__ import annotations
 
 from inspect import isclass
 from types import UnionType
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 import msgspec
 import polars as pl
@@ -52,6 +53,7 @@ class Keyword(pl.DataType):
     For string columns that are short and we might want to search by.
 
     '''
+
     @classinstmethod
     def to_python(cls) -> PythonDataType:
         return str
@@ -64,10 +66,7 @@ class Keyword(pl.DataType):
 class Mono(NumericType):
     allow_gaps: bool
 
-    def __init__(
-        self,
-        allow_gaps: bool = True
-    ) -> None:
+    def __init__(self, allow_gaps: bool = True) -> None:
         self.allow_gaps = allow_gaps
 
     @classinstmethod
@@ -75,16 +74,17 @@ class Mono(NumericType):
         return int
 
     def __eq__(self, other: PolarsDataType) -> bool:  # type: ignore[override]
-        return type(self) == type(other) and getattr(other, 'allow_gaps', None) == self.allow_gaps
+        return (
+            type(self) == type(other)
+            and getattr(other, 'allow_gaps', None) == self.allow_gaps
+        )
 
     def __hash__(self) -> int:
         return hash((self.__class__, self.allow_gaps))
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
-        return (
-            f"{class_name}(allow_gaps={self.allow_gaps})"
-        )
+        return f'{class_name}(allow_gaps={self.allow_gaps})'
 
 
 class Mono32(Mono):
@@ -117,8 +117,11 @@ SortTypes = Literal['asc', 'desc']
 # simple type kind distinction, can be used to infer settings
 TypeKind = Literal['numeric', 'string', 'nested']
 
+# only custom monotonic types
+DataTypeMono = Mono32 | Mono64
+
 # our custom extended types
-DataTypeCustom = Keyword | Mono32 | Mono64
+DataTypeCustom = type[Keyword] | DataTypeMono
 
 # all types, polars std + our custom types
 DataTypeExt = type[pl.DataType] | pl.DataType | DataTypeCustom
@@ -130,10 +133,18 @@ DataTypeExt = type[pl.DataType] | pl.DataType | DataTypeCustom
 custom_types_fixed_size: tuple[type[pl.DataType], ...] = (Mono32, Mono64)
 
 # all custom types
-custom_types: tuple[type[pl.DataType], ...] = (Keyword, *custom_types_fixed_size)
+custom_types: tuple[type[pl.DataType], ...] = (
+    Keyword,
+    *custom_types_fixed_size,
+)
 
 # all string like types, polars + custom
-all_string_likes: tuple[type[pl.DataType], ...] = (pl.Binary, pl.String, pl.Utf8, Keyword)
+all_string_likes: tuple[type[pl.DataType], ...] = (
+    pl.Binary,
+    pl.String,
+    pl.Utf8,
+    Keyword,
+)
 
 
 # byte sizes for every polars / arrow type
@@ -147,6 +158,8 @@ arrow_type_fixed_sizes: dict[type[pl.DataType], int] = {
     pl.Int32: 4,
     pl.Int64: 8,
     pl.Int128: 16,
+    pl.Float32: 4,
+    pl.Float64: 8,
     pl.Decimal: 16,
     pl.Boolean: 1,
     pl.Date: 4,
@@ -168,15 +181,17 @@ def class_of(dtype: DataTypeExt) -> type[pl.DataType]:
 
 # type predicates
 
+
 def is_fixed_size(dtype: DataTypeExt) -> bool:
     return class_of(dtype) in all_fixed_size_types
 
 
-def is_custom_type(dtype: DataTypeExt) -> bool:
+def is_custom_type(dtype: DataTypeExt) -> TypeGuard[DataTypeCustom]:
     return class_of(dtype) in custom_types
 
 
 # type size estimation
+
 
 def maybe_fixed_type_size(dtype: DataTypeExt) -> int | None:
     '''
@@ -188,10 +203,7 @@ def maybe_fixed_type_size(dtype: DataTypeExt) -> int | None:
         dtype = dtype.fallback_type()
 
     # search size or return none
-    return arrow_type_fixed_sizes.get(
-        class_of(dtype),
-        None
-    )
+    return arrow_type_fixed_sizes.get(class_of(dtype), None)
 
 
 def avg_type_size(dtype: DataTypeExt, hints: TypeHints) -> int:
@@ -234,6 +246,7 @@ def avg_type_size(dtype: DataTypeExt, hints: TypeHints) -> int:
 
 
 # additional type metadata
+
 
 def type_kind(dtype: DataTypeExt) -> TypeKind:
     '''
@@ -278,9 +291,7 @@ class TypeHints(msgspec.Struct, frozen=True):
     nested: TypeHints | None = None
 
 
-def py_type_for(
-    dtype: DataTypeExt, *, hints: TypeHints = TypeHints()
-) -> type:
+def py_type_for(dtype: DataTypeExt, *, hints: TypeHints = TypeHints()) -> type:
     '''
     Given any data type we support on columns (standard and custom) obtain
     which python type it would map to.
@@ -300,7 +311,9 @@ def py_type_for(
             py_type = dict[str, any]
 
         if isinstance(dtype, pl.List | pl.Array):
-            list_type: type[list] = list[py_type_for(dtype.inner, hints=nested_hints)]
+            list_type: type[list] = list[
+                py_type_for(dtype.inner, hints=nested_hints)
+            ]
             py_type = list_type
 
     if hints.optional:
@@ -313,35 +326,50 @@ def py_type_for(
 
 # a tiny, serializable dtype tag
 DTypeTag = Literal[
-    "u8","u16","u32","u64","i8","i16","i32","i64","i128",
-    "decimal","bool","date","time","datetime","duration",
-    "binary","string",  # polars string
-    "keyword",  # custom Keyword
-    "mono32","mono64"  # custom Mono types
+    'u8',
+    'u16',
+    'u32',
+    'u64',
+    'i8',
+    'i16',
+    'i32',
+    'i64',
+    'i128',
+    'decimal',
+    'bool',
+    'date',
+    'time',
+    'datetime',
+    'duration',
+    'binary',
+    'string',  # polars string
+    'keyword',  # custom Keyword
+    'mono32',
+    'mono64',  # custom Mono types
 ]
 
 # Maps between runtime dtype classes and tags
 dtype_tag_map: dict[DataTypeExt, DTypeTag] = {
-    pl.UInt8: "u8",
-    pl.UInt16: "u16",
-    pl.UInt32: "u32",
-    pl.UInt64: "u64",
-    pl.Int8: "i8",
-    pl.Int16: "i16",
-    pl.Int32: "i32",
-    pl.Int64: "i64",
-    pl.Int128: "i128",
-    pl.Decimal: "decimal",
-    pl.Boolean: "bool",
-    pl.Date: "date",
-    pl.Time: "time",
-    pl.Datetime: "datetime",
-    pl.Duration: "duration",
-    pl.Binary: "binary",
-    pl.String: "string",
-    Keyword: "keyword",
-    Mono32: "mono32",
-    Mono64: "mono64",
+    pl.UInt8: 'u8',
+    pl.UInt16: 'u16',
+    pl.UInt32: 'u32',
+    pl.UInt64: 'u64',
+    pl.Int8: 'i8',
+    pl.Int16: 'i16',
+    pl.Int32: 'i32',
+    pl.Int64: 'i64',
+    pl.Int128: 'i128',
+    pl.Decimal: 'decimal',
+    pl.Boolean: 'bool',
+    pl.Date: 'date',
+    pl.Time: 'time',
+    pl.Datetime: 'datetime',
+    pl.Duration: 'duration',
+    pl.Binary: 'binary',
+    pl.String: 'string',
+    Keyword: 'keyword',
+    Mono32: 'mono32',
+    Mono64: 'mono64',
 }
 
 # inverse of dtype_tag_map
@@ -372,10 +400,7 @@ class DataTypeMeta(msgspec.Struct, frozen=True):
             case pl.Duration():
                 kwargs['time_unit'] = dtype.time_unit
 
-        return DataTypeMeta(
-            tag=dtype_tag_map[dtype],
-            kwargs=kwargs
-        )
+        return DataTypeMeta(tag=dtype_tag_map[dtype], kwargs=kwargs)
 
     def decode(self) -> DataTypeExt:
         cls = tag_dtype_map[self.tag]

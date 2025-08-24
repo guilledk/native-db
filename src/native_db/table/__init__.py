@@ -15,7 +15,12 @@ from native_db._utils import (
     remote_src_protos,
 )
 from native_db.schema import Schema, SchemaLike, SchemaMeta
-from native_db.table._layout import LayoutOptions as LayoutOptions
+from native_db.table._layout import (
+    MonoPartitionMeta,
+    Partitioner as Partitioner,
+    PartitionMetaTypes as PartitionMetaTypes,
+    MonoPartitioner as MonoPartitioner,
+)
 
 
 class TableMeta(msgspec.Struct, frozen=True):
@@ -26,7 +31,7 @@ class TableMeta(msgspec.Struct, frozen=True):
     compression_level: int | None
     prefix: str
     suffix: str
-    layout: LayoutOptions
+    partitioning: dict | None = None
 
 
 class Table:
@@ -41,17 +46,13 @@ class Table:
         prefix: str = 'rows',
         suffix: str = 'parquet',
         datadir: Path | None = None,
-        layout: LayoutOptions = LayoutOptions()
+        partitioning: PartitionMetaTypes | dict = MonoPartitionMeta(),
     ) -> None:
-        schema = Schema.from_like(schema)
-        layout.validate_for(schema)
-        self.schema = schema
-
         self.name = name
+        self.schema = Schema.from_like(schema)
         self.source = source
         self.compression: ParquetCompression = compression
         self.compression_level = compression_level
-        self.layout = layout
 
         self._datadir = (datadir if datadir else get_root_datadir()).resolve()
 
@@ -59,7 +60,10 @@ class Table:
 
         if isinstance(source, str):
             if any(
-                (source.startswith(f'{proto}://') for proto in remote_src_protos)
+                (
+                    source.startswith(f'{proto}://')
+                    for proto in remote_src_protos
+                )
             ):
                 if source.startswith('http'):
                     self.source, self._local_path = fetch_remote_file(
@@ -97,6 +101,14 @@ class Table:
                 else 6
             )
 
+        part: PartitionMetaTypes = (
+            partitioning
+            if isinstance(partitioning, PartitionMetaTypes)
+            else msgspec.convert(partitioning, type=PartitionMetaTypes)
+        )
+
+        self.partitioning: Partitioner = part.runtime_for(self)
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Table):
             return NotImplemented
@@ -108,7 +120,12 @@ class Table:
         )
 
     def __hash__(self) -> int:
-        return hash((self.name, self.local_path, self.schema, self.layout))
+        return hash((
+            self.name,
+            self.local_path,
+            self.schema,
+            self.partitioning,
+        ))
 
     @cached_property
     def struct(self) -> type[msgspec.Struct]:
@@ -158,7 +175,7 @@ class Table:
         prefix: str | None = None,
         suffix: str | None = None,
         datadir: Path | None = None,
-        layout: LayoutOptions | None = None,
+        partitioning: PartitionMetaTypes | dict | None = None,
     ) -> Table:
         '''
         Helper for creating a new table definition from self, optionally
@@ -174,7 +191,7 @@ class Table:
             prefix=prefix or self.prefix,
             suffix=suffix or self.suffix,
             datadir=datadir or self._datadir,
-            layout=layout or self.layout
+            partitioning=partitioning or self.partitioning.meta.encode(),
         )
 
     def encode(self) -> TableMeta:
@@ -186,12 +203,7 @@ class Table:
             compression_level=self.compression_level,
             prefix=self.prefix,
             suffix=self.suffix,
-            layout=self.layout
+            partitioning=self.partitioning.meta.encode(),
         )
 
-    def scan(
-        self,
-        *,
-        partition_hints: dict[str, Any] = {}
-    ) -> None:
-        ...
+    def scan(self, *, partition_hints: dict[str, Any] = {}) -> None: ...

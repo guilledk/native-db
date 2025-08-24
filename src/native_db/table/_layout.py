@@ -1,116 +1,169 @@
-from datetime import datetime, timedelta
-from functools import lru_cache
-from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Protocol,
+    Self,
+    runtime_checkable,
+)
 
-import warnings
 import msgspec
+import polars as pl
 
-from native_db._utils import NativeDBWarning
+from polars.datatypes import TemporalType
+
+from native_db.dtypes import Keyword
 from native_db.errors import InvalidTableLayoutError
 from native_db.schema import Column, Schema
-from native_db.dtypes import Mono32, Mono64
+
+if TYPE_CHECKING:
+    from native_db.table import Table
 
 
-@runtime_checkable
-class PartOptionsProto(Protocol):
-    on_column: str | int
+class BasePartitionMeta(msgspec.Struct, frozen=True):
+    on_column: str | int = 0
 
-    def column(self, schema: Schema) -> Column:
-        ...
-
-    def partition(self, base_path: Path, key: Any) -> Path:
-        ...
-
-
-class PartitionOptions(msgspec.Struct, frozen=True):
-    on_column: str | int
-
-    @lru_cache
     def column(self, schema: Schema) -> Column:
         if isinstance(self.on_column, int):
             col = schema.columns[self.on_column]
 
         else:
-            col = next((
-                c
-                for c in schema.columns
-                if c.name == self.on_column
-            ), None)
+            col = next(
+                (c for c in schema.columns if c.name == self.on_column), None
+            )
             if not col:
-                raise ValueError(f'No column with name {self.on_column} found in {schema}')
+                raise ValueError(
+                    f'No column with name {self.on_column} found in {schema}'
+                )
 
         return col
 
+    def encode(self) -> dict[str, Any]:
+        return msgspec.to_builtins(self)
 
-class MonoPartOptions(PartitionOptions, frozen=True):
-    row_size: int
-    zpad_size: int = 8
+    @classmethod
+    def convert(cls, obj: dict[str, Any]) -> Self:
+        return msgspec.convert(obj, type=cls)
 
-    def __post_init__(self) -> None:
-        if self.row_size <= 0:
-            raise InvalidTableLayoutError('MonoPartOptions\'s row_size must be >= 0')
-
-    def partition(self, base_path: Path, key: Any) -> Path:
-        assert isinstance(key, int)
-        pid = key // self.row_size
-        return base_path / str(pid).zfill(self.zpad_size)
-
-
-class TimePartOptions(PartitionOptions, frozen=True):
-    delta: timedelta
-
-    def __post_init__(self) -> None:
-        if self.delta.total_seconds() == 0:
-            raise InvalidTableLayoutError('TimePartOptions\'s delta must be non-zero')
-
-    def partition(self, _: Path, key: Any) -> Path:
-        assert isinstance(key, datetime)
-        # TODO: Impl
+    def runtime_for(self, table: 'Table') -> 'Partitioner':
         raise NotImplementedError
 
 
-PartOptionsTypes = MonoPartOptions | TimePartOptions
+@runtime_checkable
+class Partitioner(Protocol):
+    meta: BasePartitionMeta
+    col: Column
+    plcol: pl.Expr
+    by_cols: list[str]
+
+    def prepare(
+        self,
+        staged: pl.LazyFrame
+    ) -> pl.LazyFrame:
+        '''
+        Return `staged` with *additional* columns that will be used as hive
+        partition keys (must be deterministic, derived from data or options).
+        Do not drop or rename user columns.
+        '''
+        ...
 
 
-class LayoutOptions(msgspec.Struct, frozen=True):
-    rows_per_file: int = 64_000
-    start_frame_index: int = 0
-    commit_threshold: int = 64_000 * 4
+class MonoPartitionMeta(BasePartitionMeta, tag='mono', frozen=True):
+    row_size: int = 100_000
 
-    partitioning: PartOptionsTypes | type[PartOptionsProto] | None = None
+    def runtime_for(self, table: 'Table') -> Partitioner:
+        return MonoPartitioner(self, table)
 
-    def validate_for(self, schema: Schema) -> None:
-        if self.commit_threshold % self.rows_per_file != 0:
-            warnings.warn(
-                'LayoutOptions\'s commit_threshold'
-                f'({self.commit_threshold}) is not divisible by rows_per_file '
-                f'({self.rows_per_file}); commits may need to leave rows on '
-                'staging area until next commit or finish is called.',
-                NativeDBWarning,
-                stacklevel=2,
-            )
 
-        if not self.partitioning:
-            return
+class MonoPartitioner(Partitioner):
+    by_cols: list[str] = ['bucket']
 
-        part_opts = self.partitioning
-        if not isinstance(part_opts, PartOptionsProto):
+    def __init__(self, meta: MonoPartitionMeta, table: 'Table') -> None:
+        self.meta = meta
+        self._table = table
+        self.col = meta.column(table.schema)
+        self.plcol = pl.col(self.col.name)
+
+        from native_db.dtypes import DataTypeMono
+
+        if not isinstance(self.col.type, DataTypeMono):
             raise InvalidTableLayoutError(
-                'Provided partitioning options not following PartOptionsProto'
+                'Mono partitioner expected column type to be monotonic'
             )
 
-        match part_opts:
-            case MonoPartOptions():
-                if part_opts.row_size % self.commit_threshold != 0:
-                    raise InvalidTableLayoutError(
-                        'MonoPartOptions\'s row_size must be divisible by LayoutOptions\'s commit_threshold'
-                    )
+        self._row_size = meta.row_size
+        self._allow_gaps = self.col.type.allow_gaps
 
-                col = part_opts.column(schema)
+    def prepare(self, staged: pl.LazyFrame) -> pl.LazyFrame:
+        # map to buckets by fixed range size row_size
+        return staged.with_columns(
+            (self.plcol // self._row_size).alias(self.by_cols[0])
+        )
 
-                if type(col.type) not in (Mono32, Mono64):
-                    raise TypeError('Only monotonic types allowed on partition columns')
 
-            case TimePartOptions():
-                raise NotImplementedError
+TimePartKind = Literal['year', 'month', 'day']
+
+
+class TimePartitionMeta(BasePartitionMeta, tag='time', frozen=True):
+    kind: TimePartKind = 'year'
+
+    def runtime_for(self, table: 'Table') -> Partitioner:
+        return TimePartitioner(self, table)
+
+
+class TimePartitioner(Partitioner):
+    def __init__(self, meta: TimePartitionMeta, table: 'Table') -> None:
+        self.meta = meta
+        self._table = table
+        self.col = meta.column(table.schema)
+        self.plcol = pl.col(self.col.name)
+
+        if not isinstance(self.col.type, TemporalType):
+            raise InvalidTableLayoutError(
+                'Time partitioner expected column type to be temporal'
+            )
+
+        self.by_cols = [meta.kind]
+        self._part_exp: pl.Expr = getattr(self.plcol.dt, meta.kind)().alias(meta.kind)
+
+    def prepare(self, staged: pl.LazyFrame) -> pl.LazyFrame:
+        return staged.with_columns(self._part_exp)
+
+
+class KeywordPartitionMeta(BasePartitionMeta, tag='keyword', frozen=True):
+    char_depth: int = 1
+
+    def runtime_for(self, table: 'Table') -> 'Partitioner':
+        return KeywordPartitioner(self, table)
+
+
+class KeywordPartitioner(Partitioner):
+
+    def __init__(self, meta: KeywordPartitionMeta, table: 'Table') -> None:
+        self.meta = meta
+        self._table = table
+        self.col = meta.column(table.schema)
+        self.plcol = pl.col(self.col.name)
+
+        if self.col.type != Keyword:
+            raise InvalidTableLayoutError(
+                'Keyword partitioner expected column type to be keyword'
+            )
+
+        self.by_cols = [f'char{i}' for i in range(meta.char_depth)]
+
+    def prepare(self, staged: pl.LazyFrame) -> pl.LazyFrame:
+        """
+        Adds derived columns: char0..char{depth-1}, each a 1-char slice at that index.
+        Non-existent positions become empty strings.
+        """
+        # derive N single-char columns using .str.slice(offset, length=1)
+        derived = [
+            self.plcol.str.slice(i, 1).alias(name)
+            for i, name in enumerate(self.by_cols)
+        ]
+        return staged.with_columns(*derived)
+
+
+PartitionerTypes = MonoPartitioner | TimePartitioner | KeywordPartitioner
+PartitionMetaTypes = MonoPartitionMeta | TimePartitionMeta | KeywordPartitionMeta

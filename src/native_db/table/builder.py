@@ -71,7 +71,9 @@ class TableBuilder:
     def rows(self) -> int:
         return len(self._first_col) if self._col_lists else 0
 
-    def flush(self, *, compression: IpcCompression = 'uncompressed') -> memoryview:
+    def flush(
+        self, *, compression: IpcCompression = 'uncompressed'
+    ) -> memoryview:
         '''
         Convert accumulated rows into a single in-memory IPC stream and clear/advance buffers.
 

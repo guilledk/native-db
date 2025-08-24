@@ -8,7 +8,7 @@ import pytest
 import polars as pl
 import xxhash
 
-from native_db._bloom import BloomMeta, DiskBloom, bloom_params
+from native_db._bloom import BloomMeta, IPCDiskBloom, bloom_params
 
 
 def test_bootstrap_and_metadata_math(tmp_path: Path):
@@ -17,7 +17,7 @@ def test_bootstrap_and_metadata_math(tmp_path: Path):
     block_bits = 1 << 10  # 1024 bits
     seeds = (0x11111111, 0x22222222)
 
-    db = DiskBloom(
+    db = IPCDiskBloom(
         tmp_path,
         N=N,
         P=P,
@@ -50,21 +50,21 @@ def test_bootstrap_and_metadata_math(tmp_path: Path):
 
 def test_persistence_across_instances(tmp_path: Path):
     key = 'hello-world'
-    db1 = DiskBloom(tmp_path, N=100, P=0.01, block_bits=1 << 12)
+    db1 = IPCDiskBloom(tmp_path, N=100, P=0.01, block_bits=1 << 12)
     assert not db1.might_contain(
         key
     )  # may be FP, but almost surely False first
     db1.add(key)  # sets bits in one block
 
     # Re-open from existing metadata.json (no N/P required)
-    db2 = DiskBloom(tmp_path)
+    db2 = IPCDiskBloom(tmp_path)
     assert db2.might_contain(key)  # must not be a false negative
 
 
 def test_add_and_membership_no_false_negatives(tmp_path: Path):
     # Use modest capacity to keep FP rate reasonable but focus on "no false negatives"
     N, P = 5_000, 0.01
-    db = DiskBloom(tmp_path, N=N, P=P, block_bits=1 << 15)
+    db = IPCDiskBloom(tmp_path, N=N, P=P, block_bits=1 << 15)
 
     keys = [f'k{i}' for i in range(2000)]
     for k in keys:
@@ -77,7 +77,7 @@ def test_add_and_membership_no_false_negatives(tmp_path: Path):
 
 def test_add_many_batches_across_blocks(tmp_path: Path):
     # Force many small blocks to exercise grouping/bucketing logic
-    db = DiskBloom(tmp_path, N=10_000, P=0.01, block_bits=1 << 10)
+    db = IPCDiskBloom(tmp_path, N=10_000, P=0.01, block_bits=1 << 10)
 
     keys = [f'user:{i}' for i in range(5000)]
     db.add_many(keys)  # grouped per block then RMW once
@@ -97,7 +97,7 @@ def test_add_many_batches_across_blocks(tmp_path: Path):
 
 def test_basic_concurrency_best_effort_locking(tmp_path: Path):
     # The lock is POSIX-only best effort; verify threads don't corrupt state
-    db = DiskBloom(tmp_path, N=50_000, P=0.01, block_bits=1 << 14)
+    db = IPCDiskBloom(tmp_path, N=50_000, P=0.01, block_bits=1 << 14)
 
     keys_a = [f'a{i}' for i in range(2000)]
     keys_b = [f'b{i}' for i in range(2000)]
@@ -121,13 +121,13 @@ def test_basic_concurrency_best_effort_locking(tmp_path: Path):
 def test_reopen_without_params_requires_existing_metadata(tmp_path: Path):
     # metadata.json missing -> must pass N and P (bootstrap)
     with pytest.raises(FileNotFoundError):
-        _ = DiskBloom(tmp_path)  # no N/P and no metadata yet
+        _ = IPCDiskBloom(tmp_path)  # no N/P and no metadata yet
 
 
 def test_invalid_block_bits(tmp_path: Path):
     # block_bits must be a power of two
     with pytest.raises(ValueError):
-        _ = DiskBloom(tmp_path, N=100, P=0.1, block_bits=1000)
+        _ = IPCDiskBloom(tmp_path, N=100, P=0.1, block_bits=1000)
 
 
 def test_bloom_params_input_validation():
@@ -139,7 +139,7 @@ def test_bloom_params_input_validation():
 
 def test_accessors_and_meta_roundtrip(tmp_path: Path):
     N, P = 1234, 0.02
-    db = DiskBloom(
+    db = IPCDiskBloom(
         tmp_path,
         N=N,
         P=P,
@@ -153,17 +153,17 @@ def test_accessors_and_meta_roundtrip(tmp_path: Path):
 
     # Rewrite metadata on disk then reload (sanity for _write_meta path)
     db._write_meta()  # internal, but harmless to exercise
-    db2 = DiskBloom(tmp_path)
+    db2 = IPCDiskBloom(tmp_path)
     assert db2.capacity == N
     assert db2.target_fpr == P
     assert db2.total_bits == m
 
 
 # Helpers
-def _force_keys_for_block(db: DiskBloom, bid: int, n: int) -> list[str]:
+def _force_keys_for_block(db: IPCDiskBloom, bid: int, n: int) -> list[str]:
     '''
     Generate 'n' string keys that map to a desired block id for this bloom.
-    Uses the same hash seeds as DiskBloom (double hashing) to target bid.
+    Uses the same hash seeds as IPCDiskBloom (double hashing) to target bid.
     '''
     keys = []
     s1, s2 = db.meta.seeds  # uses same seeds as impl
@@ -183,7 +183,7 @@ def test_threaded_same_block_contention(tmp_path: Path):
     read-modify-write path. We assert no false negatives for inserted keys and
     that the block file remains readable as a valid single-row table afterward.
     '''
-    db = DiskBloom(
+    db = IPCDiskBloom(
         tmp_path, N=100_000, P=0.01, block_bits=1 << 12
     )  # flock file locking per block
     # Choose a target block and craft keys for it
@@ -219,7 +219,7 @@ def test_threaded_cross_block_contention(tmp_path: Path):
     Threads add keys spread across many blocks to stress concurrent creation of
     multiple block dirs/files (ensuring mkdir + atomic replace are safe).
     '''
-    db = DiskBloom(tmp_path, N=200_000, P=0.01, block_bits=1 << 12)
+    db = IPCDiskBloom(tmp_path, N=200_000, P=0.01, block_bits=1 << 12)
     B = db.meta.B  # number of blocks
 
     # Create keys targeting first ~min(16,B) blocks evenly
@@ -274,10 +274,10 @@ def _mp_same_block_worker(root_str: str, keys: list[str]) -> None:
     os.environ.setdefault('POLARS_MAX_THREADS', '2')
 
     from native_db._bloom import (
-        DiskBloom,
+        IPCDiskBloom,
     )  # import inside to avoid pytest collection side effects
 
-    local = DiskBloom(Path(root_str))  # reopen via metadata.json
+    local = IPCDiskBloom(Path(root_str))  # reopen via metadata.json
     local.add_many(keys)  # single RMW per targeted block
 
 
@@ -288,7 +288,7 @@ def test_multiprocess_same_block_locking(tmp_path):
     '''
     os.environ.setdefault('POLARS_MAX_THREADS', '2')
 
-    db = DiskBloom(tmp_path, N=60_000, P=0.01, block_bits=1 << 12)
+    db = IPCDiskBloom(tmp_path, N=60_000, P=0.01, block_bits=1 << 12)
     bid = 1
 
     # 4 processes * 1000 keys, all mapped to the same block
@@ -324,7 +324,7 @@ def test_add_many_concurrent_with_add(tmp_path: Path):
     Interleave add_many (grouped per block) with single add() writers. Ensures
     both paths use per-block locking and produce a consistent result.
     '''
-    db = DiskBloom(tmp_path, N=150_000, P=0.01, block_bits=1 << 12)
+    db = IPCDiskBloom(tmp_path, N=150_000, P=0.01, block_bits=1 << 12)
 
     # random keys for add_many; plus targeted same-block keys for add()
     rng = random.Random(42)
@@ -359,7 +359,7 @@ def test_empirical_false_positive_rate(tmp_path: Path):
     We keep runtime modest but enough to be stable.
     '''
     N, P = 20_000, 0.01
-    db = DiskBloom(tmp_path, N=N, P=P, block_bits=1 << 16)
+    db = IPCDiskBloom(tmp_path, N=N, P=P, block_bits=1 << 16)
 
     inserted = [f'in-{i}' for i in range(N)]
     db.add_many(inserted)
@@ -384,7 +384,7 @@ def test_empirical_false_positive_rate(tmp_path: Path):
 def test_might_contain_many_basic(tmp_path: Path):
     # modest capacity to keep FP rate low while focusing on no-FN guarantee
     N, P = 10_000, 0.005
-    db = DiskBloom(tmp_path, N=N, P=P, block_bits=1 << 15)
+    db = IPCDiskBloom(tmp_path, N=N, P=P, block_bits=1 << 15)
 
     # Insert a set of keys
     inserted = [f'ins-{i}' for i in range(3000)]
@@ -421,7 +421,7 @@ def test_might_contain_many_basic(tmp_path: Path):
 
 
 def test_might_contain_many_reads_each_block_once(tmp_path: Path, monkeypatch):
-    db = DiskBloom(tmp_path, N=50_000, P=0.01, block_bits=1 << 12)
+    db = IPCDiskBloom(tmp_path, N=50_000, P=0.01, block_bits=1 << 12)
     # Create keys targeting multiple known blocks
     blocks = min(8, db.meta.B)
     per_block = 50
@@ -452,7 +452,7 @@ def test_might_contain_many_reads_each_block_once(tmp_path: Path, monkeypatch):
 
 
 def test_might_contain_many_concurrent_with_writers(tmp_path: Path):
-    db = DiskBloom(tmp_path, N=120_000, P=0.01, block_bits=1 << 12)
+    db = IPCDiskBloom(tmp_path, N=120_000, P=0.01, block_bits=1 << 12)
 
     # Prepare: some hot-block keys + random bulk for writers
     hot_bid = 0
