@@ -199,44 +199,63 @@ class TableWriter:
         if total_rows < rows_per_file:
             return
 
-        lf = pl.concat([sf.scan() for sf in prefix], rechunk=False)
-        lf = self._part.prepare(lf)
+        staged_frame = pl.concat([sf.scan() for sf in prefix], rechunk=False)
 
-        # 1) sink to temporary commit root
+        # sink to temporary commit root
         commit_root = self._staging_path / f'commit-{uuid.uuid4().hex}'
-        lf.sink_parquet(
-            pl.PartitionParted(
-                commit_root,
-                by=self._part.by_cols,
-                include_key=True,
-                per_partition_sort_by=self._part.plcol,
-            ),
-            compression=self._table.compression,
-            compression_level=self._table.compression_level,
-            row_group_size=self._table.schema.row_group_size,
-            mkdir=True,
-        )
+        if self._part:
+            staged_frame = self._part.prepare(staged_frame)
 
-        # 2) integrate commit_root into final
-        final_root = self._table.local_path
-        for bucket_dir in commit_root.iterdir():
-            if not bucket_dir.is_dir():
-                continue
-            final_bucket = final_root / bucket_dir.name
-            final_bucket.mkdir(parents=True, exist_ok=True)
+            staged_frame.sink_parquet(
+                pl.PartitionParted(
+                    commit_root,
+                    by=self._part.by_cols,
+                    include_key=True,
+                    per_partition_sort_by=self._part.plcol,
+                ),
+                compression=self._table.compression,
+                compression_level=self._table.compression_level,
+                row_group_size=self._table.schema.row_group_size,
+                mkdir=True,
+            )
 
-            # find next local index
-            existing = sorted(final_bucket.glob('part-*.parquet'))
-            next_idx = len(existing)
+            # integrate commit_root into final
+            final_root = self._table.local_path
+            for bucket_dir in commit_root.iterdir():
+                if not bucket_dir.is_dir():
+                    continue
+                final_bucket = final_root / bucket_dir.name
+                final_bucket.mkdir(parents=True, exist_ok=True)
 
-            for src in sorted(bucket_dir.glob('*.parquet')):
-                dst = final_bucket / f'part-{next_idx:05d}.parquet'
-                src.replace(dst)
-                next_idx += 1
+                # find next local index
+                existing = sorted(final_bucket.glob('part-*.parquet'))
+                next_idx = len(existing)
+
+                for src in sorted(bucket_dir.glob('*.parquet')):
+                    dst = final_bucket / f'part-{next_idx:05d}.parquet'
+                    src.replace(dst)
+                    next_idx += 1
+
+        else:
+            # NO PARTITIONING: one file straight to table root
+            commit_root.mkdir(parents=True, exist_ok=True)
+            tmp_parquet = commit_root / 'commit.parquet'
+            staged_frame.sink_parquet(
+                tmp_parquet,
+                compression=self._table.compression,
+                compression_level=self._table.compression_level,
+                row_group_size=self._table.schema.row_group_size,
+                mkdir=True,
+            )
+            final_root = self._table.local_path
+            final_root.mkdir(parents=True, exist_ok=True)
+            dst = final_root / f'part-{self._next_part_index:05d}.parquet'
+            tmp_parquet.replace(dst)
+            self._next_part_index += 1
 
         shutil.rmtree(commit_root, ignore_errors=True)
 
-        # 3) drop committed staging frames
+        # drop committed staging frames
         for sf in prefix:
             sf.path.unlink(missing_ok=True)
             self._staging.remove(sf)

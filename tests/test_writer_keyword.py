@@ -6,14 +6,14 @@ from native_db._testing import (
     pubmed_author_table,
     pubmed_author_random_frame_stream,
 )
-from native_db.table._layout import KeywordPartitionMeta, KeywordPartitioner
+from native_db.table import DictionaryPartitioner, DictionaryPartition
 from native_db.table.writer import TableWriter, TableWriterOptions
 
 
 def test_keyword_partitioner_by_cols_depth1():
     # default table uses char_depth=1 in helper
     part = pubmed_author_table.partitioning
-    assert isinstance(part, KeywordPartitioner)
+    assert isinstance(part, DictionaryPartitioner)
     assert part.by_cols == ['char0']
 
 
@@ -33,12 +33,12 @@ def test_keyword_partitioner_prepare_depth1_basic():
 def test_keyword_partitioner_by_cols_depth2():
     # Same schema, but force char_depth=2
     t2 = pubmed_author_table.copy(
-        partitioning=KeywordPartitionMeta(on_column='name', char_depth=2),
+        partitioning=DictionaryPartition(on_column='name', depth=2),
         name='pubmed_author_depth2',
         source='static/pubmed_author_depth2',
     )
     part = t2.partitioning
-    assert isinstance(part, KeywordPartitioner)
+    assert isinstance(part, DictionaryPartitioner)
     assert part.by_cols == ['char0', 'char1']
 
     df = pl.DataFrame(
@@ -62,7 +62,7 @@ def test_writer_creates_keyword_partitions(tmp_path: Path):
         name='pubmed_author_it',
         source='static/pubmed_author_it',
         datadir=tmp_path,  # override root to temp
-        partitioning=KeywordPartitionMeta(on_column='name', char_depth=1),
+        partitioning=DictionaryPartition(on_column='name', depth=1),
     )
 
     # Small thresholds so we commit quickly
@@ -112,7 +112,7 @@ def test_writer_creates_keyword_partitions_depth2(tmp_path: Path):
         name='pubmed_author_it2',
         source='static/pubmed_author_it2',
         datadir=tmp_path,  # temp root
-        partitioning=KeywordPartitionMeta(on_column='name', char_depth=2),
+        partitioning=DictionaryPartition(on_column='name', depth=2),
     )
 
     opts = TableWriterOptions(commit_threshold=100, rows_per_file=50)

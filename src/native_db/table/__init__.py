@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from functools import cached_property
 from pathlib import Path
-from typing import Any
 
 import msgspec
+import polars as pl
 
-from polars._typing import ParquetCompression
+from polars._typing import ParquetCompression, PartitioningScheme
 
 from native_db._utils import (
     fetch_remote_file,
@@ -16,10 +16,14 @@ from native_db._utils import (
 )
 from native_db.schema import Schema, SchemaLike, SchemaMeta
 from native_db.table._layout import (
-    MonoPartitionMeta,
     Partitioner as Partitioner,
-    PartitionMetaTypes as PartitionMetaTypes,
+    PartitionTypes as PartitionTypes,
+    RowLenPartitioner as RowLenPartitioner,
+    RowLenPartition as RowLenPartition,
     MonoPartitioner as MonoPartitioner,
+    MonoPartition as MonoPartition,
+    DictionaryPartitioner as DictionaryPartitioner,
+    DictionaryPartition as DictionaryPartition,
 )
 
 
@@ -43,10 +47,10 @@ class Table:
         *,
         compression: ParquetCompression = 'zstd',
         compression_level: int | None = None,
-        prefix: str = 'rows',
+        prefix: str = 'part',
         suffix: str = 'parquet',
         datadir: Path | None = None,
-        partitioning: PartitionMetaTypes | dict = MonoPartitionMeta(),
+        partitioning: PartitionTypes | dict | None = None,
     ) -> None:
         self.name = name
         self.schema = Schema.from_like(schema)
@@ -101,13 +105,15 @@ class Table:
                 else 6
             )
 
-        part: PartitionMetaTypes = (
-            partitioning
-            if isinstance(partitioning, PartitionMetaTypes)
-            else msgspec.convert(partitioning, type=PartitionMetaTypes)
-        )
+        self.partitioning: Partitioner | None = None
+        if partitioning:
+            part: PartitionTypes = (
+                partitioning
+                if isinstance(partitioning, PartitionTypes)
+                else msgspec.convert(partitioning, type=PartitionTypes)
+            )
 
-        self.partitioning: Partitioner = part.runtime_for(self)
+            self.partitioning = part.runtime_for(self)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Table):
@@ -175,7 +181,7 @@ class Table:
         prefix: str | None = None,
         suffix: str | None = None,
         datadir: Path | None = None,
-        partitioning: PartitionMetaTypes | dict | None = None,
+        partitioning: PartitionTypes | dict | None = None,
     ) -> Table:
         '''
         Helper for creating a new table definition from self, optionally
@@ -191,7 +197,7 @@ class Table:
             prefix=prefix or self.prefix,
             suffix=suffix or self.suffix,
             datadir=datadir or self._datadir,
-            partitioning=partitioning or self.partitioning.meta.encode(),
+            partitioning=partitioning or (self.partitioning.meta.encode() if self.partitioning else None),
         )
 
     def encode(self) -> TableMeta:
@@ -203,7 +209,8 @@ class Table:
             compression_level=self.compression_level,
             prefix=self.prefix,
             suffix=self.suffix,
-            partitioning=self.partitioning.meta.encode(),
+            partitioning=self.partitioning.meta.encode() if self.partitioning else None,
         )
 
-    def scan(self, *, partition_hints: dict[str, Any] = {}) -> None: ...
+    def scan(self) -> pl.LazyFrame:
+        return pl.scan_parquet(self._local_path)

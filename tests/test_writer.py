@@ -5,7 +5,7 @@ import pytest
 import polars as pl
 
 from native_db.table import Table
-from native_db.table._layout import MonoPartitionMeta
+from native_db.table._layout import MonoPartition
 from native_db.table.writer import TableWriter, TableWriterOptions
 
 from native_db._testing import (
@@ -21,7 +21,7 @@ def test_bucket_file_naming_and_indices(tmp_path):
     rows_per_file = 5_000  # two files per bucket when we push 10k
     t = block_table.copy(
         datadir=tmp_path,
-        partitioning=MonoPartitionMeta(on_column='number', row_size=row_size),
+        partitioning=MonoPartition(on_column='number', row_size=row_size),
     )
 
     w = TableWriter(
@@ -57,7 +57,7 @@ def test_per_file_rowcount_and_key_bounds(tmp_path):
     rows_per_file = 2_000
     t = block_table.copy(
         datadir=tmp_path,
-        partitioning=MonoPartitionMeta(on_column='number', row_size=row_size),
+        partitioning=MonoPartition(on_column='number', row_size=row_size),
     )
     w = TableWriter(
         t,
@@ -97,7 +97,7 @@ def test_per_file_rowcount_and_key_bounds(tmp_path):
 def test_out_of_order_frames_delay_commit(tmp_path):
     t = block_table.copy(
         datadir=tmp_path,
-        partitioning=MonoPartitionMeta(on_column='number', row_size=10_000),
+        partitioning=MonoPartition(on_column='number', row_size=10_000),
     )
     rows_per_file = 1_000
     w = TableWriter(
@@ -133,7 +133,7 @@ def test_hive_filter_by_bucket_scan(tmp_path):
     rows_per_file = 5_000
     t = block_table.copy(
         datadir=tmp_path,
-        partitioning=MonoPartitionMeta(on_column='number', row_size=row_size),
+        partitioning=MonoPartition(on_column='number', row_size=row_size),
     )
     w = TableWriter(
         t,
@@ -187,7 +187,7 @@ def test_stream_dense_blocks_partitioned_by_bucket(
     t: Table = block_table.copy(
         datadir=tmp_path,
         # keep same source/datadir; change partitioning to smaller row_size
-        partitioning=MonoPartitionMeta(on_column='number', row_size=row_size),
+        partitioning=MonoPartition(on_column='number', row_size=row_size),
     )
 
     writer = TableWriter(
@@ -243,7 +243,7 @@ def test_stream_gapped_pubmed_partitioned_by_bucket(
     '''
     t: Table = pubmed_table.copy(
         datadir=tmp_path,
-        partitioning=MonoPartitionMeta(on_column='pmid', row_size=row_size),
+        partitioning=MonoPartition(on_column='pmid', row_size=row_size),
     )
 
     writer = TableWriter(

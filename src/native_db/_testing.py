@@ -8,7 +8,7 @@ import polars as pl
 from native_db._utils import epoch
 from native_db.dtypes import Keyword, Mono, TypeHints
 from native_db.table import Table
-from native_db.table._layout import KeywordPartitionMeta, MonoPartitionMeta, TimePartitionMeta
+from native_db.table._layout import DictionaryPartition, MonoPartition, TimePartition
 
 
 block_table = Table(
@@ -20,7 +20,7 @@ block_table = Table(
         ('hash', Keyword, TypeHints(avg_str_size=64)),
     ),
     datadir=Path(__file__).parent.parent.parent / 'tests/.test-db',
-    partitioning=MonoPartitionMeta(on_column='number')
+    partitioning=MonoPartition(on_column='number')
 )
 
 
@@ -114,7 +114,7 @@ pubmed_table = Table(
         ('title', pl.String, TypeHints(avg_str_size=128)),
     ),
     datadir=Path(__file__).parent.parent / 'tests/.test-db',
-    partitioning=MonoPartitionMeta(on_column='pmid')
+    partitioning=MonoPartition(on_column='pmid')
 )
 
 
@@ -168,7 +168,7 @@ pubmed_author_table = Table(
         ('pmid', Mono(size=8), TypeHints(sort='asc')),
     ),
     datadir=Path(__file__).parent.parent / 'tests/.test-db',
-    partitioning=KeywordPartitionMeta(on_column='name', char_depth=1),
+    partitioning=DictionaryPartition(on_column='name', depth=1),
 )
 
 
@@ -223,7 +223,7 @@ market_table = Table(
         ('close', pl.Float64),
     ),
     datadir=Path(__file__).parent.parent / 'tests/.test-db',
-    partitioning=TimePartitionMeta(on_column='time'),
+    partitioning=TimePartition(on_column='time'),
 )
 
 

@@ -8,7 +8,7 @@ import pytest
 
 from native_db._testing import market_table, market_frame_stream
 from native_db.table import Table
-from native_db.table._layout import TimePartKind, TimePartitionMeta
+from native_db.table._layout import TimePartKind, TimePartition
 from native_db.table.writer import TableWriter, TableWriterOptions
 
 
@@ -16,7 +16,7 @@ def _mk_table(tmp_path: Path, kind: TimePartKind) -> Table:
     # copy the catalog entry, but point to a fresh datadir and desired partition kind
     t = market_table.copy(
         datadir=tmp_path,
-        partitioning=TimePartitionMeta(on_column="time", kind=kind),
+        partitioning=TimePartition(on_column="time", kind=kind),
     )
     # ensure a clean slate
     if t.local_path.exists():
