@@ -50,7 +50,7 @@ class TableBuilder:
 
             if c.hints.unique:
                 self._unique_idx.append(i)
-                bpath = table.local_path / f'.{c.name}-{os.getpid()}.bloom'
+                bpath = table.local_path / '.staging' / f'.{c.name}-{os.getpid()}.bloom'
                 bpath.parent.mkdir(parents=True, exist_ok=True)
                 self._blooms[i] = DiskBloom(bpath, N=30_000_000, P=0.001)
 

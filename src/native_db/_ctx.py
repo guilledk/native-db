@@ -458,6 +458,37 @@ class ContextWriter:
                 for frame in frames:
                     self._tg.start_soon(self.stage_direct, name, frame)
 
+    async def stage_frame(
+        self,
+        name: str,
+        frame: pl.DataFrame,
+        index: int,
+        *,
+        format: FrameFormats = 'ipc'
+    ) -> None:
+        table = getattr(self.ctx, name)
+        path = table.local_path / '.staging' / f'frame-{index:05d}.{frame.height}.{format}'
+
+        sinkop = sink_frame(
+            frame.lazy(),
+            path,
+            format=format
+        )
+
+        if self._executor:
+            await self._executor.collect(sinkop)
+
+        else:
+            await sinkop.collect_async()
+
+        await self.stage(
+            name,
+            path,
+            index=index,
+            number_of_rows=frame.height,
+            format=format
+        )
+
 @asynccontextmanager
 async def open_ctx_writer(
     ctx: Context,

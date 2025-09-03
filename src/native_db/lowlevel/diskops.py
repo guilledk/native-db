@@ -55,7 +55,7 @@ class ScanFrameFn(Protocol):
 
 
 def scan_frame(
-    path: str | Path,
+    path: str | Path | list[str] | list[Path] | tuple[str, ...] | tuple[Path, ...],
     *,
     format: FrameFormats | None = None,
     rechunk: bool = False,
@@ -67,7 +67,9 @@ def scan_frame(
 
     '''
     if not format:
-        format = format_from_path(path)
+        format = format_from_path(
+            path if not isinstance(path, list | tuple) else path[0]
+        )
 
     scan_fn: ScanFrameFn
     match format:

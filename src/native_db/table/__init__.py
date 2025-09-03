@@ -291,6 +291,12 @@ class Table:
             )
         )
 
+    @property
+    def disk_size(self) -> int:
+        return sum(
+            f.stat().st_size for f in self.files()
+        )
+
     def part_file(self, i: int | str, *, zpad: int = 5) -> str:
         if isinstance(i, int):
             i = f'{i:0{zpad}d}'
@@ -320,7 +326,7 @@ class Table:
 
         if self._local_path and self._local_path.exists():
             frame = scan_frame(
-                f'{self._local_path}',
+                self.files(),
                 format=self.format,
                 hive_partitioning=self.partitioning is not None
             )
