@@ -26,15 +26,14 @@ build-backend = 'uv_build'
 dev = [
     'pdbp>=1.7.1',
     'pytest>=8.4.1',
+    'pytest-anyio>=0.0.0',
     'pytest-benchmark>=5.1.0',
-    'pytest-trio>=0.8.0',
 ]
 
 [tool.pytest.ini_options]
 addopts = [
   '--show-capture=no',
 ]
-trio_mode = true
 
 [tool.ruff]
 line-length = 80

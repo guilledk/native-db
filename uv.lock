@@ -161,29 +161,13 @@ wheels = [
 [[package]]
 name = "hotbaud"
 version = "0.1.0"
-source = { editable = "../hotbaud" }
+source = { git = "https://github.com/guilledk/hotbaud.git?rev=59f48e4fd20776b79978a582ca2bfe19f6313a32#59f48e4fd20776b79978a582ca2bfe19f6313a32" }
 dependencies = [
     { name = "anyio", extra = ["trio"] },
     { name = "cffi" },
     { name = "colorlog" },
     { name = "msgspec" },
     { name = "psutil" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "anyio", extras = ["trio"], specifier = ">=4.10.0" },
-    { name = "cffi", specifier = ">=1.17.1" },
-    { name = "colorlog", specifier = ">=6.9.0" },
-    { name = "msgspec", specifier = ">=0.19.0" },
-    { name = "psutil", specifier = ">=7.0.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.4.1" },
-    { name = "pytest-anyio", specifier = ">=0.0.0" },
-    { name = "trio", specifier = ">=0.30.0" },
 ]
 
 [[package]]
@@ -252,15 +236,15 @@ dependencies = [
 dev = [
     { name = "pdbp" },
     { name = "pytest" },
+    { name = "pytest-anyio" },
     { name = "pytest-benchmark" },
-    { name = "pytest-trio" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "anyio", extras = ["trio"], specifier = ">=4.10.0" },
     { name = "colorlog", specifier = ">=6.9.0" },
-    { name = "hotbaud", editable = "../hotbaud" },
+    { name = "hotbaud", git = "https://github.com/guilledk/hotbaud.git?rev=59f48e4fd20776b79978a582ca2bfe19f6313a32" },
     { name = "msgspec", specifier = ">=0.19.0" },
     { name = "polars", specifier = ">=1.32.3" },
     { name = "pyarrow", specifier = ">=21.0.0" },
@@ -272,8 +256,8 @@ requires-dist = [
 dev = [
     { name = "pdbp", specifier = ">=1.7.1" },
     { name = "pytest", specifier = ">=8.4.1" },
+    { name = "pytest-anyio", specifier = ">=0.0.0" },
     { name = "pytest-benchmark", specifier = ">=5.1.0" },
-    { name = "pytest-trio", specifier = ">=0.8.0" },
 ]
 
 [[package]]
@@ -438,6 +422,19 @@ wheels = [
 ]
 
 [[package]]
+name = "pytest-anyio"
+version = "0.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/00/44/a02e5877a671b0940f21a7a0d9704c22097b123ed5cdbcca9cab39f17acc/pytest-anyio-0.0.0.tar.gz", hash = "sha256:b41234e9e9ad7ea1dbfefcc1d6891b23d5ef7c9f07ccf804c13a9cc338571fd3", size = 1560, upload-time = "2021-06-29T22:57:30.846Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c6/25/bd6493ae85d0a281b6a0f248d0fdb1d9aa2b31f18bcd4a8800cf397d8209/pytest_anyio-0.0.0-py2.py3-none-any.whl", hash = "sha256:dc8b5c4741cb16ff90be37fddd585ca943ed12bbeb563de7ace6cd94441d8746", size = 1999, upload-time = "2021-06-29T22:57:29.158Z" },
+]
+
+[[package]]
 name = "pytest-benchmark"
 version = "5.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -448,20 +445,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/39/d0/a8bd08d641b393db3be3819b03e2d9bb8760ca8479080a26a5f6e540e99c/pytest-benchmark-5.1.0.tar.gz", hash = "sha256:9ea661cdc292e8231f7cd4c10b0319e56a2118e2c09d9f50e1b3d150d2aca105", size = 337810, upload-time = "2024-10-30T11:51:48.521Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9e/d6/b41653199ea09d5969d4e385df9bbfd9a100f28ca7e824ce7c0a016e3053/pytest_benchmark-5.1.0-py3-none-any.whl", hash = "sha256:922de2dfa3033c227c96da942d1878191afa135a29485fb942e85dff1c592c89", size = 44259, upload-time = "2024-10-30T11:51:45.94Z" },
-]
-
-[[package]]
-name = "pytest-trio"
-version = "0.8.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "outcome" },
-    { name = "pytest" },
-    { name = "trio" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/13/08/056279526554c6c6e6ad6d4a479a338d14dc785ac30be8bdc6ca0153c1be/pytest-trio-0.8.0.tar.gz", hash = "sha256:8363db6336a79e6c53375a2123a41ddbeccc4aa93f93788651641789a56fb52e", size = 46525, upload-time = "2022-11-01T17:24:29.352Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e9/22/71953f47e0da5852c899f58cd7a31e6100f37c632b7b9ee52d067613a844/pytest_trio-0.8.0-py3-none-any.whl", hash = "sha256:e6a7e7351ae3e8ec3f4564d30ee77d1ec66e1df611226e5618dbb32f9545c841", size = 27221, upload-time = "2022-11-01T17:24:27.501Z" },
 ]
 
 [[package]]

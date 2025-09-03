@@ -24,6 +24,7 @@ def test_keyword_partitioner_prepare_depth1_basic():
          'pmid': [1, 2, 3, 4, 5]},
         schema=pubmed_author_table.schema.as_polars(),
     )
+    assert pubmed_author_table.partitioning
     out = pubmed_author_table.partitioning.prepare(df.lazy()).collect()
     assert 'char0' in out.columns
     # first character or '' for empty
@@ -52,7 +53,7 @@ def test_keyword_partitioner_by_cols_depth2():
     assert out['char1'].to_list() == ['m', 'o', '', '']
 
 
-def test_writer_creates_keyword_partitions(tmp_path: Path):
+async def test_writer_creates_keyword_partitions(tmp_path: Path, anyio_backend):
     """
     Integration: make sure differently named authors land under different
     char buckets on disk (char0=A, char0=B, ...).
@@ -63,11 +64,9 @@ def test_writer_creates_keyword_partitions(tmp_path: Path):
         source='static/pubmed_author_it',
         datadir=tmp_path,  # override root to temp
         partitioning=DictionaryPartition(on_column='name', depth=1),
+        # Small thresholds so we commit quickly
+        writer_opts=TableWriterOptions(commit_threshold=100, rows_per_file=50)
     )
-
-    # Small thresholds so we commit quickly
-    opts = TableWriterOptions(commit_threshold=100, rows_per_file=50)
-    writer = TableWriter(table, options=opts)
 
     # Emit two batches with clearly different first letters
     # e.g., 6 'Alice*' rows and 6 'Bob*' rows -> two buckets 'A' and 'B'
@@ -82,8 +81,11 @@ def test_writer_creates_keyword_partitions(tmp_path: Path):
         )
     )
 
+    writer = table.writer()
     for df, i in batches:
-        writer.push(df, frame_index=i)
+        await writer.stage_frame(df, i)
+
+    await writer.drain()
 
     # force a final commit if needed by pushing an empty no-op with finish semantics
     # (TableWriter commits automatically if threshold met; ensure it happened)
@@ -98,11 +100,11 @@ def test_writer_creates_keyword_partitions(tmp_path: Path):
 
     # And each bucket should have at least one parquet
     for b in ('char0=A', 'char0=B'):
-        parts = sorted((root / b).glob('part-*.parquet'))
+        parts = sorted((root / b).glob(table.file_pattern))
         assert parts, f'missing parquet parts under {b}'
 
 
-def test_writer_creates_keyword_partitions_depth2(tmp_path: Path):
+async def test_writer_creates_keyword_partitions_depth2(tmp_path: Path, anyio_backend):
     """
     Integration: make sure differently named authors land under different
     char buckets on disk (char0=<X>, char1=<Y>).
@@ -113,10 +115,8 @@ def test_writer_creates_keyword_partitions_depth2(tmp_path: Path):
         source='static/pubmed_author_it2',
         datadir=tmp_path,  # temp root
         partitioning=DictionaryPartition(on_column='name', depth=2),
+        writer_opts=TableWriterOptions(commit_threshold=100, rows_per_file=50)
     )
-
-    opts = TableWriterOptions(commit_threshold=100, rows_per_file=50)
-    writer = TableWriter(table, options=opts)
 
     # Two batches with authors that differ on both first and second char
     batches = list(
@@ -129,8 +129,11 @@ def test_writer_creates_keyword_partitions_depth2(tmp_path: Path):
         )
     )
 
+    writer = table.writer()
     for df, i in batches:
-        writer.push(df, frame_index=i)
+        await writer.stage_frame(df, i)
+
+    await writer.drain()
 
     root = table.local_path
     assert root.exists(), "table root should exist after push"
@@ -145,5 +148,5 @@ def test_writer_creates_keyword_partitions_depth2(tmp_path: Path):
             second_level = {p.name for p in (root / first).iterdir() if p.is_dir()}
             assert all(s.startswith('char1=') for s in second_level)
             for sec in second_level:
-                parts = sorted((root / first / sec).glob('part-*.parquet'))
+                parts = sorted((root / first / sec).glob(table.file_pattern))
                 assert parts, f'missing parquet parts under {first}/{sec}'
