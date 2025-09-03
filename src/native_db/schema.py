@@ -18,9 +18,10 @@ from native_db.dtypes import (
     should_use_dictionary,
     type_kind,
 )
+from native_db.structs import FrozenStruct
 
 
-class ColumnMeta(msgspec.Struct, frozen=True):
+class ColumnMeta(FrozenStruct, frozen=True):
     name: str
     type: DataTypeMeta
     hints: TypeHints
@@ -41,7 +42,10 @@ class Column(msgspec.Struct, dict=True, frozen=True):
                 hints = c[2] if len(c) == 3 else TypeHints()
                 return Column(name, typ, hints)
 
-            case ColumnMeta():
+            case dict() | ColumnMeta():
+                if isinstance(c, dict):
+                    c = ColumnMeta.convert(c)
+
                 return Column(c.name, c.type.decode(), c.hints)
 
         return c
@@ -76,12 +80,13 @@ class Column(msgspec.Struct, dict=True, frozen=True):
 ColumnLike = (
     tuple[str, DataTypeExt]
     | tuple[str, DataTypeExt, TypeHints]
+    | dict
     | ColumnMeta
     | Column
 )
 
 
-class SchemaMeta(msgspec.Struct, frozen=True):
+class SchemaMeta(FrozenStruct, frozen=True):
     columns: list[ColumnMeta]
     row_group_size: int
 
@@ -117,7 +122,10 @@ class Schema:
             case Schema():
                 return s
 
-            case SchemaMeta():
+            case dict() | SchemaMeta():
+                if isinstance(s, dict):
+                    s = SchemaMeta.convert(s)
+
                 return Schema(s.columns, row_group_size=s.row_group_size)
 
         return Schema(s)
@@ -192,4 +200,4 @@ class Schema:
         )
 
 
-SchemaLike = Iterable[ColumnLike] | SchemaMeta | Schema
+SchemaLike = Iterable[ColumnLike] | dict | SchemaMeta | Schema

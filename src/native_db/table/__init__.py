@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-from functools import cached_property
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, AsyncGenerator, Literal
 
 import msgspec
 import polars as pl
-
-from polars._typing import ParquetCompression, PartitioningScheme
 
 from native_db._utils import (
     fetch_remote_file,
     get_root_datadir,
     path_size,
     remote_src_protos,
+    solve_redirects,
 )
+from native_db.errors import NativeDBError
+from native_db.lowlevel.diskops import FrameFormats
 from native_db.schema import Schema, SchemaLike, SchemaMeta
+from native_db.structs import FrozenStruct
 from native_db.table._layout import (
     Partitioner as Partitioner,
     PartitionTypes as PartitionTypes,
@@ -24,18 +27,28 @@ from native_db.table._layout import (
     MonoPartition as MonoPartition,
     DictionaryPartitioner as DictionaryPartitioner,
     DictionaryPartition as DictionaryPartition,
+    TimePartitioner as TimePartitioner,
+    TimePartition as TimePartition
 )
+from native_db.table.builder import TableBuilder
+from native_db.table.writer import TableWriter, TableWriterOptions
 
 
-class TableMeta(msgspec.Struct, frozen=True):
+class TableMeta(FrozenStruct, frozen=True):
     name: str
     source: str
     schema: SchemaMeta
-    compression: ParquetCompression
+    format: FrameFormats
+    compression: str
     compression_level: int | None
-    prefix: str
-    suffix: str
-    partitioning: dict | None = None
+    prefix: str | None
+    suffix: str | None
+    datadir: str | None
+    partitioning: dict | None
+    writer_opts: TableWriterOptions | None
+
+
+TableSrcKind = Literal['local', 'remote']
 
 
 class Table:
@@ -45,23 +58,28 @@ class Table:
         source: str | Path,
         schema: SchemaLike,
         *,
-        compression: ParquetCompression = 'zstd',
+        format: FrameFormats = 'parquet',
+        compression: str = 'zstd',
         compression_level: int | None = None,
-        prefix: str = 'part',
-        suffix: str = 'parquet',
-        datadir: Path | None = None,
+        prefix: str | None = None,
+        suffix: str | None = None,
+        datadir: str | Path | None = None,
         partitioning: PartitionTypes | dict | None = None,
+        writer_opts: TableWriterOptions | None = None,
+        struct: type[msgspec.Struct] | None = None,
     ) -> None:
         self.name = name
         self.schema = Schema.from_like(schema)
         self.source = source
-        self.compression: ParquetCompression = compression
+        self.format: FrameFormats = format
+        self.compression: str = compression
         self.compression_level = compression_level
 
-        self._datadir = (datadir if datadir else get_root_datadir()).resolve()
+        self._datadir = (Path(datadir) if datadir else get_root_datadir()).resolve()
 
         self._local_path: Path
 
+        self.src_kind: str
         if isinstance(source, str):
             if any(
                 (
@@ -69,17 +87,11 @@ class Table:
                     for proto in remote_src_protos
                 )
             ):
-                if source.startswith('http'):
-                    self.source, self._local_path = fetch_remote_file(
-                        self._datadir, source, prefix=prefix, suffix=suffix
-                    )
-
-                else:
-                    raise RuntimeError(
-                        f'TODO: implement remote source fetch for {source}'
-                    )
+                self.src_kind = 'remote'
+                self._local_path = self._datadir / f'remote/{name}'
 
             else:
+                self.src_kind = 'local'
                 self._local_path = Path(source)
 
         elif isinstance(source, Path):
@@ -90,6 +102,7 @@ class Table:
 
         self.prefix = prefix
         self.suffix = suffix
+        self._suffix = suffix if suffix else format
 
         if (
             self.compression != 'uncompressed'
@@ -115,6 +128,20 @@ class Table:
 
             self.partitioning = part.runtime_for(self)
 
+        self.struct = (
+            struct
+            if struct
+            else msgspec.defstruct(
+                f'{self.name.capitalize()}Row',
+                fields=((col.name, col.py_type) for col in self.schema.columns),
+                module='native_db.autogen',
+            )
+        )
+        self.writer_opts = writer_opts
+
+        # used when calling .scan with use_cache=True
+        self._frame: pl.LazyFrame | None = None
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Table):
             return NotImplemented
@@ -133,20 +160,40 @@ class Table:
             self.partitioning,
         ))
 
-    @cached_property
-    def struct(self) -> type[msgspec.Struct]:
-        return msgspec.defstruct(
-            f'{self.name.capitalize()}Row',
-            fields=((col.name, col.py_type) for col in self.schema.columns),
-            module='native_db.autogen',
-        )
+    @staticmethod
+    def from_like(t: TableLike, **kwargs) -> Table:
+        if isinstance(t, Table):
+            return t
+
+        if isinstance(t, dict):
+            t = TableMeta.convert(t)
+
+        return Table(**t.to_dict(), **kwargs)
+
+    @property
+    def file_pattern(self) -> str:
+        p = f'*.{self._suffix}'
+        if self.prefix:
+            p = '-'.join((self.prefix, p))
+
+        return p
 
     @property
     def local_path(self) -> Path:
+        if not isinstance(self._local_path, Path):
+            raise NativeDBError(
+                'Table internal _local_path not set? Likely remote table not downloaded'
+            )
+
         return self._local_path
 
     @property
     def exists(self) -> bool:
+        if not isinstance(self._local_path, Path):
+            raise NativeDBError(
+                'Table internal _local_path not set? Likely remote table not downloaded'
+            )
+
         return self._local_path.exists()
 
     @property
@@ -165,7 +212,7 @@ class Table:
             f'Path: {self.local_path}',
             f'Source: {self.source or "N/A"}',
             f'Compression: {self.compression} (level={self.compression_level})',
-            f'File pattern: {self.prefix}*.{self.suffix}',
+            f'File pattern: {self.prefix}*.{self._suffix}',
             '',
             self.schema.pretty_str(),
         ]
@@ -176,12 +223,14 @@ class Table:
         name: str | None = None,
         source: str | None = None,
         schema: SchemaLike | None = None,
-        compression: ParquetCompression | None = None,
+        compression: str | None = None,
         compression_level: int | None = None,
         prefix: str | None = None,
         suffix: str | None = None,
         datadir: Path | None = None,
         partitioning: PartitionTypes | dict | None = None,
+        writer_opts: TableWriterOptions | None = None,
+        struct: type[msgspec.Struct] | None = None
     ) -> Table:
         '''
         Helper for creating a new table definition from self, optionally
@@ -190,7 +239,7 @@ class Table:
         '''
         return Table(
             name=name or self.name,
-            source=source or self.name,
+            source=source or self.source,
             schema=schema or self.schema,
             compression=compression or self.compression,
             compression_level=compression_level or self.compression_level,
@@ -198,6 +247,8 @@ class Table:
             suffix=suffix or self.suffix,
             datadir=datadir or self._datadir,
             partitioning=partitioning or (self.partitioning.meta.encode() if self.partitioning else None),
+            writer_opts=writer_opts or self.writer_opts,
+            struct=struct or self.struct
         )
 
     def encode(self) -> TableMeta:
@@ -205,12 +256,105 @@ class Table:
             name=self.name,
             source=str(self.source),
             schema=self.schema.encode(),
+            format=self.format,
             compression=self.compression,
             compression_level=self.compression_level,
             prefix=self.prefix,
             suffix=self.suffix,
+            datadir=str(self._datadir),
             partitioning=self.partitioning.meta.encode() if self.partitioning else None,
+            writer_opts=self.writer_opts
         )
 
-    def scan(self) -> pl.LazyFrame:
-        return pl.scan_parquet(self._local_path)
+    def builder(self, target_row_size: int | None = None) -> TableBuilder:
+        return TableBuilder(self, target_row_size=target_row_size)
+
+    def writer(self, **kwargs) -> TableWriter:
+        return TableWriter(
+            self,
+            options=self.writer_opts,
+            **kwargs
+        )
+
+    # @asynccontextmanager
+    # async def writer(self, **kwargs) -> AsyncGenerator[TableWriter, None]:
+    #     async with open_table_writer(self, self.writer_opts, **kwargs) as w:
+    #         yield w
+
+    def empty(self) -> pl.LazyFrame:
+        return pl.LazyFrame(schema=self.schema.as_polars())
+
+    def files(self) -> tuple[Path, ...]:
+        if not self._local_path.exists():
+            return tuple()
+
+        return tuple(
+            sorted(
+                p
+                for p in self._local_path.rglob(f'**/{self.file_pattern}')
+                if '.staging' in p.parts
+            )
+        )
+
+    def part_file(self, i: int | str, *, zpad: int = 5) -> str:
+        if isinstance(i, int):
+            i = f'{i:0{zpad}d}'
+
+        p = f'{i}.{self._suffix}'
+        if self.prefix:
+            p = '-'.join((self.prefix, p))
+        return p
+
+    def sink_args(self) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            'format': self.format,
+        }
+        if self.format != 'csv':
+            args['compression'] = self.compression
+
+        if self.format == 'parquet':
+            args['compression_level'] = self.compression_level
+            args['row_group_size'] = self.schema.row_group_size
+
+        return args
+
+    def scan(self, *, use_cache: bool = True) -> pl.LazyFrame:
+        if use_cache and self._frame is not None:
+            return self._frame
+
+
+        if self._local_path and self._local_path.exists():
+            frame = pl.scan_ipc(
+                f'{self._local_path}',
+                hive_partitioning=self.partitioning is not None
+            )
+
+        else:
+            match self.src_kind:
+                case 'local':
+                    frame = self.empty()
+
+                case 'remote':
+                    assert isinstance(self.source, str)
+
+                    if self.source.startswith('http'):
+                        self.source = solve_redirects(self.source)
+                        self._local_path = fetch_remote_file(
+                            self._local_path, self.source,
+                            prefix=self.prefix, suffix=self.suffix
+                        )
+                        frame = pl.scan_parquet(self._local_path)
+
+                    else:
+                        raise NotImplementedError
+
+                case _:
+                    raise NotImplementedError
+
+        if use_cache:
+            self._frame = frame
+
+        return frame
+
+
+TableLike = dict | TableMeta | Table
