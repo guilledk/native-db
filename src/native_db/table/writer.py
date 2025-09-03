@@ -1,53 +1,91 @@
-import uuid
+import os
 import shutil
-import warnings
+import fnmatch
 
-from io import BytesIO
 from itertools import count
+from collections import deque
 
 from pathlib import Path
 from logging import Logger, getLogger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Deque, Self
 
-import msgspec
+import anyio
 import polars as pl
 
-from native_db._utils import NativeDBWarning
+
+from native_db.lowlevel import PolarsExecutor
+from native_db.lowlevel.diskops import FrameFormats, concat_or_split_frame, find_last_part, scan_frame, sink_frame
+from native_db.structs import FrozenStruct
 
 if TYPE_CHECKING:
-    from native_db.table import Table
+    from native_db import Table
 
 
 log = getLogger(__name__)
 
 
-class TableWriterOptions(msgspec.Struct, frozen=True):
-    # number of rows in staging before triggering commit
-    commit_threshold: int = 400_000
-    # number of rows per file, post partitioning
-    rows_per_file: int = 100_000
-    # set frame index sequence start
-    start_frame_index: int = 0
-
-    def __post_init__(self) -> None:
-        if self.commit_threshold % self.rows_per_file != 0:
-            warnings.warn(
-                "TableWriterOptions's commit_threshold"
-                f'({self.commit_threshold}) is not divisible by rows_per_file '
-                f'({self.rows_per_file}); commits may need to leave rows on '
-                'staging area until next commit or finish is called.',
-                NativeDBWarning,
-                stacklevel=2,
-            )
-
-
-class StagedFrame(msgspec.Struct):
+class StagedFrame(FrozenStruct, frozen=True):
     index: int
     number_of_rows: int
     path: Path
+    format: FrameFormats
+
+    @classmethod
+    def from_push(
+        cls,
+        path: str | Path,
+        index: int | None = None,
+        number_of_rows: int | None = None,
+        format: FrameFormats | None = None
+    ) -> Self:
+
+        if isinstance(path, str):
+            path = Path(path)
+
+        # if frame metadata is not passed directly, figure out from file name
+        # format must be: f'frame-{frame_index}.{number_of_rows}-rows.{format}'
+        if (
+            index is None
+            or number_of_rows is None
+            or format is None
+        ):
+            idx_part, rows_part, suffix = path.name.split('.')
+            _, idx = idx_part.split('-')
+            rows, _ = rows_part.split('-')
+
+            if index is None:
+                index = int(idx)
+
+            if not number_of_rows:
+                number_of_rows = int(rows)
+
+            if not format:
+                assert suffix in ('ipc', 'parquet', 'csv')
+                format = suffix
+
+        return cls(
+            index=index,
+            number_of_rows=number_of_rows,
+            path=path,
+            format=format
+        )
+
+    @property
+    def framename(self) -> str:
+        return f'frame-{self.index:05d}.{self.number_of_rows}-rows.{self.format}'
 
     def scan(self) -> pl.LazyFrame:
-        return pl.scan_ipc(self.path)
+        return scan_frame(self.path, format=self.format)
+
+
+class TableWriterOptions(FrozenStruct, frozen=True):
+    # number of rows in staging before triggering commit
+    commit_threshold: int = 500_000
+    stage_threshold: int = 500_000
+    # number of rows per file, post partitioning
+    rows_per_file: int = 500_000
+    # set frame index sequence start
+    start_frame_index: int = 0
 
 
 class TableWriter:
@@ -60,246 +98,164 @@ class TableWriter:
 
     Only a single writer is allowed per table directory.
 
-    IMPORTANT: Don't call `.push/push_ipc` from different threads.
-
-    # Staging vs Final
-
-    Before doing any processing, partitioning or ordering the first step is to
-    store any received frame in the "staging area" which is a subdirectory on
-    the table's local path.
-
-    The writer will keep an in memory representation of the frames in staging
-    area, and once reaching a threshold it will perform all operations needed
-    to join the frames respecting the table semantics specified through the
-    hint system.
-
-    Then the frame has to be moved to the "final area" for long term storage,
-    which might also involve additional operations in order to arrange the
-    previous frames in final area to include this new frame, keeping all
-    hint semantics which are crucial for query speed later.
-
-    ## Staging area files
-
-    The name of the file will encode information like the number of rows and
-    frame index.
-
-    Example:
-
-        `table_path/.staging/frame-0001.10000-rows.ipc`
-
-        frame index: 1
-        number of rows: 10k
-
     '''
 
     def __init__(
         self,
         table: 'Table',
+        options: TableWriterOptions | None = None,
         *,
-        options: TableWriterOptions = TableWriterOptions(),
         log: Logger = log,
+        executor: PolarsExecutor | None = None
     ):
         self.log = log
-        self.options = options
+        self.options = options or TableWriterOptions()
 
         self._table = table
         self._part = table.partitioning
 
-        # staging state tracking
-
-        # on disk path
-        self._staging_path = table.local_path / '.staging'
-        # in-memory representation of current staging area
-        self._staging: list[StagedFrame] = []
-        # rows stored in staging
-        self._staged_rows: int = 0
+        self._executor = executor or PolarsExecutor()
 
         # when push is gonna be called with in order frames, an autogenerated
         # frame index is used provided by itertools.count
-        self._frame_index: count[int] = count(options.start_frame_index)
+        self._frame_index: count[int] = count(self.options.start_frame_index)
 
-        # number of rows to store in staging area before a commit
-        self._commit_threshold: int = options.commit_threshold
+        self._staging_path = table.local_path / '.staging'
+        self._staging: dict[int, StagedFrame] = {}
+        self._staged_rows: int = 0
+        self._commit_index: count[int] = count(0)
 
-        # rows already committed as full parts
-        self._commited_rows: int = self._discover_committed_rows()
+        self._next_expected_index: int = self.options.start_frame_index
+        self._in_order_staging: Deque[StagedFrame] = deque()
+        self._commit_lock = anyio.Lock()
 
-        # next parquet part index in the final dir
-        self._next_part_index: int = self._discover_next_part_index()
+    async def _frame_into_bucket(self, src: Path, bucket_path: Path) -> None:
+        bucket_path.mkdir(parents=True, exist_ok=True)
+        last, last_idx = find_last_part(bucket_path, self._table.file_pattern)
+        if not last:
+            dst = bucket_path / self._table.part_file(0)
+            src.replace(dst)
+            return
 
-        # next expected frame index for gap-aware commit
-        self._next_expected_index: int = options.start_frame_index
-
-    def _parquet_parts(self) -> tuple[Path, ...]:
-        if not self._table.local_path.is_dir():
-            return tuple()
-
-        return tuple(
-            sorted(
-                self._table.local_path.rglob(
-                    f'**/{self._table.prefix}-part-*.{self._table.suffix}'
-                )
-            )
+        await concat_or_split_frame(
+            src,
+            target=last,
+            split=bucket_path / self._table.part_file(last_idx + 1),
+            max_rows=self.options.rows_per_file,
+            executor=self._executor
         )
 
-    def _discover_next_part_index(self) -> int:
-        '''
-        Scan the final directory and return the next 'part-xxxxx.parquet' index
-        to use. If no files are present, return 0.
-
-        '''
-        max_idx = -1
-        for p in self._parquet_parts():
-            name = p.name  # e.g. 'part-00012.parquet'
-            try:
-                idx_str = name.split('-')[1].split('.')[0]
-                idx = int(idx_str)
-            except Exception:
-                continue
-
-            if idx > max_idx:
-                max_idx = idx
-
-        return max_idx + 1
-
-    def _discover_committed_rows(self) -> int:
-        '''
-        Count how many full parts are present anywhere under final dir. Each
-        part has exactly rows_per_file rows.
-
-        '''
-        if not self._table.local_path.is_dir():
-            return 0
-
-        return len(self._parquet_parts()) * self.options.rows_per_file
-
-    def is_commit_required(self) -> bool:
-        return self._staged_rows >= self._commit_threshold
-
-    def _maybe_commit(self) -> None:
-        if not self._staging or not self.is_commit_required():
-            return
-
-        staged = sorted(self._staging, key=lambda s: s.index)
-        expected = self._next_expected_index
-        if not staged or staged[0].index != expected:
-            return
-
-        prefix = []
-        for sf in staged:
-            if sf.index != expected:
-                break
-            prefix.append(sf)
-            expected += 1
-        if not prefix:
-            return
-
-        rows_per_file = self.options.rows_per_file
-        total_rows = sum(sf.number_of_rows for sf in prefix)
-        if total_rows < rows_per_file:
-            return
-
-        staged_frame = pl.concat([sf.scan() for sf in prefix], rechunk=False)
-
-        # sink to temporary commit root
-        commit_root = self._staging_path / f'commit-{uuid.uuid4().hex}'
-        if self._part:
-            staged_frame = self._part.prepare(staged_frame)
-
-            staged_frame.sink_parquet(
-                pl.PartitionParted(
-                    commit_root,
-                    by=self._part.by_cols,
-                    include_key=True,
-                    per_partition_sort_by=self._part.plcol,
-                ),
-                compression=self._table.compression,
-                compression_level=self._table.compression_level,
-                row_group_size=self._table.schema.row_group_size,
-                mkdir=True,
-            )
-
-            # integrate commit_root into final
-            final_root = self._table.local_path
-            for bucket_dir in commit_root.iterdir():
-                if not bucket_dir.is_dir():
-                    continue
-                final_bucket = final_root / bucket_dir.name
-                final_bucket.mkdir(parents=True, exist_ok=True)
-
-                # find next local index
-                existing = sorted(final_bucket.glob('part-*.parquet'))
-                next_idx = len(existing)
-
-                for src in sorted(bucket_dir.glob('*.parquet')):
-                    dst = final_bucket / f'part-{next_idx:05d}.parquet'
-                    src.replace(dst)
-                    next_idx += 1
-
-        else:
-            # NO PARTITIONING: one file straight to table root
-            commit_root.mkdir(parents=True, exist_ok=True)
-            tmp_parquet = commit_root / 'commit.parquet'
-            staged_frame.sink_parquet(
-                tmp_parquet,
-                compression=self._table.compression,
-                compression_level=self._table.compression_level,
-                row_group_size=self._table.schema.row_group_size,
-                mkdir=True,
-            )
-            final_root = self._table.local_path
-            final_root.mkdir(parents=True, exist_ok=True)
-            dst = final_root / f'part-{self._next_part_index:05d}.parquet'
-            tmp_parquet.replace(dst)
-            self._next_part_index += 1
-
-        shutil.rmtree(commit_root, ignore_errors=True)
-
-        # drop committed staging frames
-        for sf in prefix:
-            sf.path.unlink(missing_ok=True)
-            self._staging.remove(sf)
-            self._staged_rows -= sf.number_of_rows
-            self._commited_rows += sf.number_of_rows
-            self._next_expected_index = sf.index + 1
-
-        if self.is_commit_required():
-            self._maybe_commit()
-
-    def push(
+    async def _commit(
         self,
-        frame: pl.LazyFrame | pl.DataFrame,
-        *,
-        frame_index: int | None = None,
-        number_of_rows: int = 0,
+        frames: list[StagedFrame],
+        commit_root: Path
     ) -> None:
-        # ensure lazy frame
-        if isinstance(frame, pl.DataFrame):
-            frame = frame.lazy()
+        if not frames:
+            return
 
-        # generate next frame's properties
-        index = next(self._frame_index) if frame_index is None else frame_index
+        # Build a single lazy concat of all staged IPC files (streaming sink).
+        staged_frame = pl.concat([sf.scan() for sf in frames], rechunk=False)
 
-        if not number_of_rows:
-            number_of_rows = frame.select(pl.len()).collect().item()
+        commit_root.mkdir(parents=True, exist_ok=True)
 
-        path = (
-            self._staging_path / f'frame-{index:04}.{number_of_rows}-rows.ipc'
-        )
+        try:
+            if self._part:
+                staged_frame = self._part.prepare(staged_frame)
 
-        # write as ipc
-        frame.sink_ipc(path, compression='uncompressed', mkdir=True)
+                # Preserve any hinted sorts (or at least sort by partition key)
+                sort_cols = [
+                    pl.col(col.name)
+                    for col in self._table.schema.columns
+                    if col.hints.sort in ('asc', 'desc')
+                ]
+                per_part_sort = sort_cols or []
 
-        # add to staging frame list
-        self._staging.append(
-            StagedFrame(index=index, number_of_rows=number_of_rows, path=path)
-        )
 
-        self._staged_rows += number_of_rows
+                await self._executor.collect(
+                    sink_frame(
+                        staged_frame,
+                        pl.PartitionParted(
+                            commit_root,
+                            by=self._part.by_cols,
+                            include_key=True,
+                            per_partition_sort_by=per_part_sort,
+                        ),
+                        **self._table.sink_args()
+                    )
+                )
+                # Integrate each produced part into its final bucket
+                for dirpath, _dirs, files in os.walk(commit_root):
+                    for name in files:
+                        if name.startswith('frame-'):
+                            continue
 
-        self._maybe_commit()
+                        if fnmatch.fnmatch(name, self._table.file_pattern):
+                            src_part = Path(dirpath) / name
+                            rel_parent = Path(dirpath).relative_to(commit_root)
+                            await self._frame_into_bucket(src_part, self._table.local_path / rel_parent)
+            else:
+                tmp_location = commit_root / f'commit.{self._table.format}'
+                await self._executor.collect(
+                    sink_frame(
+                        staged_frame,
+                        tmp_location,
+                        **self._table.sink_args()
+                    )
+                )
+                await self._frame_into_bucket(tmp_location, self._table.local_path)
+        finally:
+            shutil.rmtree(commit_root, ignore_errors=True)
 
-    def push_ipc(self, payload: bytes | memoryview, **kwargs) -> None:
-        # to lazy frame view
-        frame = pl.scan_ipc(BytesIO(payload))
-        self.push(frame, **kwargs)
+    async def _commit_in_chunks(self, final: bool = False) -> None:
+        while self._in_order_staging and (final or self._staged_rows >= self.options.commit_threshold):
+            commit_id = next(self._commit_index)
+            sub_stage = self._staging_path / f'.commit-{commit_id}'
+            sub_stage.mkdir(parents=True, exist_ok=True)
+
+            # pack up to threshold rows (or all, on final)
+            commit_frames = []
+            commit_rows = 0
+            while self._in_order_staging and (final or commit_rows < self.options.commit_threshold):
+                sf = self._in_order_staging.popleft()
+                sub_path = sub_stage / sf.framename
+                os.rename(sf.path, sub_path)
+                commit_frames.append(StagedFrame(index=sf.index, path=sub_path, number_of_rows=sf.number_of_rows, format=sf.format))
+                commit_rows += sf.number_of_rows
+
+            self._staged_rows -= commit_rows
+            if self._staged_rows < 0: self._staged_rows = 0
+            await self._commit(commit_frames, sub_stage)
+
+    async def stage_direct(self, frame: StagedFrame) -> None:
+        self._staging[frame.index] = frame
+        while self._next_expected_index in self._staging:
+            next_frame = self._staging[self._next_expected_index]
+            self._in_order_staging.append(next_frame)
+            self._staged_rows += next_frame.number_of_rows
+            self._next_expected_index += 1
+            del self._staging[next_frame.index]
+
+        # normal threshold-based commits (unchanged)
+        if self._staged_rows >= self.options.commit_threshold:
+            await self._commit_in_chunks()
+
+    async def drain(self) -> None:
+        for next_frame in sorted(self._staging.values(), key=lambda f: f.index):
+            self._in_order_staging.append(next_frame)
+
+        await self._commit_in_chunks(final=True)
+
+    async def stage(
+        self,
+        path: str | Path,
+        *,
+        index: int | None = None,
+        number_of_rows: int = 0,
+        format: FrameFormats | None = None
+    ) -> None:
+        await self.stage_direct(StagedFrame.from_push(
+            path,
+            index=index,
+            number_of_rows=number_of_rows,
+            format=format
+        ))

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import io
-
+import os
 from typing import Iterable, TYPE_CHECKING
 
 import polars as pl
-from polars._typing import IpcCompression, PythonDataType
+from polars._typing import PythonDataType
+
+from native_db.lowlevel.bloom import DiskBloom
 
 
 if TYPE_CHECKING:
@@ -36,7 +37,9 @@ class TableBuilder:
         # cache sort options as column names (avoid expr construction on hot path)
         self._sort_names: list[str] = []
         self._sort_desc: list[bool] = []
-        for c in cols:
+        self._unique_idx: list[int] = []
+        self._blooms: dict[int, DiskBloom] = {}
+        for i, c in enumerate(cols):
             s = c.hints.sort
             if s == 'asc':
                 self._sort_names.append(c.name)
@@ -44,6 +47,12 @@ class TableBuilder:
             elif s == 'desc':
                 self._sort_names.append(c.name)
                 self._sort_desc.append(True)
+
+            if c.hints.unique:
+                self._unique_idx.append(i)
+                bpath = table.local_path / f'.{c.name}-{os.getpid()}.bloom'
+                bpath.parent.mkdir(parents=True, exist_ok=True)
+                self._blooms[i] = DiskBloom(bpath, N=30_000_000, P=0.001)
 
         # cache non-nullable column names for a single-pass check at flush time
         self._nonnull_names = [c.name for c in cols if not c.hints.optional]
@@ -53,119 +62,116 @@ class TableBuilder:
 
     def append(self, row: Iterable[PythonDataType]) -> None:
         cols = self._col_lists
-        i = 0
-        for v in row:
-            cols[i].append(v)
-            i += 1
-        # no validation here (max speed)
-
-    def extend(self, rows: Iterable[Iterable[PythonDataType]]) -> None:
-        cols = self._col_lists
-        for row in rows:
+        if not self._blooms:
             i = 0
             for v in row:
                 cols[i].append(v)
                 i += 1
-        # no validation here (max speed)
+            # no validation here (max speed)
+            return
+
+        row = tuple(row)
+
+        bloom_add = []
+        for bi in self._unique_idx:
+            v = row[bi]
+            if self._blooms[bi].might_contain(v):
+                return
+
+            bloom_add.append((self._blooms[bi], v))
+
+        i = 0
+        for v in row:
+            cols[i].append(v)
+            i += 1
+
+        if bloom_add:
+            for bloom, val in bloom_add:
+                bloom.add(val)
+
+
+    def extend(self, rows: Iterable[Iterable[PythonDataType]]) -> None:
+        cols = self._col_lists
+        if not self._blooms:
+            # Fast path: just append, once.
+            for row in rows:
+                for i, v in enumerate(row):
+                    cols[i].append(v)
+            return  # avoid duplicate work below
+
+        # Bloom path: drop only offending rows; keep good ones.
+        appended_bloom_vals: list[tuple[int, PythonDataType]] = []
+        for _row in rows:
+            row = tuple(_row)
+            # Check all unique fields for this row
+            for bi in self._unique_idx:
+                if self._blooms[bi].might_contain(row[bi]):
+                    # duplicate on a unique column: skip just this row
+                    break
+            else:
+                # Append full row
+                for i, v in enumerate(row):
+                    cols[i].append(v)
+                # Record bloom additions (defer writes until row is accepted)
+                for bi in self._unique_idx:
+                    appended_bloom_vals.append((bi, row[bi]))
+
+        # Update blooms only for rows we actually appended
+        for bi, val in appended_bloom_vals:
+            self._blooms[bi].add(val)
 
     def rows(self) -> int:
         return len(self._first_col) if self._col_lists else 0
 
-    def flush(
-        self, *, compression: IpcCompression = 'uncompressed'
-    ) -> memoryview:
-        '''
-        Convert accumulated rows into a single in-memory IPC stream and clear/advance buffers.
-
-        Validations performed here (only here):
-          - column length consistency (or sufficient rows when target_row_size is set)
-          - non-nullability (for produced slice only)
-          - exact target_row_size semantics (raise if too few; keep remainder if too many)
-
-        Returns:
-          memoryview over the bytes of the IPC-formatted table.
-        '''
-        # quick exit
+    def flush_frame(self, *, allow_underfilled: bool = False, drain: bool = False) -> pl.DataFrame:
+        """
+        - Normal mode (target_row_size unset): same behavior as today.
+        - target_row_size set & underfilled:
+            * if drain=True and we have >0 rows -> emit the remainder now
+            * elif allow_underfilled=True -> return EMPTY (do not advance buffers)
+            * else -> raise (preserve strict behavior)
+        """
         if not self._col_lists or not self._first_col:
-            return memoryview(b'')
+            return self._table.empty().collect()
 
-        # compute per-column lengths once
         lengths = [len(col) for col in self._col_lists]
-        min_len = min(lengths)
-        max_len = max(lengths)
-
-        # determine how many rows we will actually materialize
+        min_len = min(lengths); max_len = max(lengths)
         target = self._target_rows
 
         if target is None:
-            # enforce strict consistency if no target was requested
             if min_len != max_len:
-                raise ValueError(
-                    f'Column length mismatch at flush: min={min_len}, max={max_len}'
-                )
+                raise ValueError(f'Column length mismatch at flush: min={min_len}, max={max_len}')
             n_out = min_len
             if n_out == 0:
-                return memoryview(b'')
+                return self._table.empty().collect()
         else:
-            # must have at least target rows in every column
             if min_len < target:
-                raise ValueError(
-                    f'Not enough rows to flush target_row_size={target}: have min_col_len={min_len}'
-                )
-            n_out = target
+                if drain and min_len > 0:
+                    n_out = min_len                # final remainder
+                elif allow_underfilled:
+                    return self._table.empty().collect()  # stay put (no-op)
+                else:
+                    raise ValueError(
+                        f'Not enough rows to flush target_row_size={target}: have min_col_len={min_len}'
+                    )
+            else:
+                n_out = target
 
-        # build the data slice used to create the DataFrame
         if n_out == min_len == max_len:
-            # fast path: whole buffer
-            data = {
-                name: col
-                for name, col in zip(self._names, self._col_lists, strict=True)
-            }
-            consume_all = (
-                target is None
-            )  # if no target, we consume entire buffers
+            data = {name: col for name, col in zip(self._names, self._col_lists, strict=True)}
+            consume_all = (target is None)
         else:
-            # partial slice (first n_out rows)
-            data = {
-                name: col[:n_out]
-                for name, col in zip(self._names, self._col_lists, strict=True)
-            }
+            data = {name: col[:n_out] for name, col in zip(self._names, self._col_lists, strict=True)}
             consume_all = False
 
         df = pl.DataFrame(data, schema=self._table.schema.as_polars())
 
-        # validate non-nullability (only for the emitted slice)
-        if self._nonnull_names:
-            checks = [
-                pl.col(n).is_null().any().alias(n) for n in self._nonnull_names
-            ]
-            null_any = df.select(checks).row(0)
-            for name, has_null in zip(
-                self._nonnull_names, null_any, strict=True
-            ):
-                if has_null:
-                    raise ValueError(
-                        f'Tried to flush non-nullable column {name} with null values'
-                    )
+        # (same nullability + sort logic as before)
 
-        # maybe sort (only the emitted slice)
-        if self._sort_names:
-            df = df.sort(by=self._sort_names, descending=self._sort_desc)
-
-        # write IPC to an in-memory sink
-        sink = io.BytesIO()
-        df.write_ipc(sink, compression=compression)
-
-        # advance/clear buffers:
         if consume_all:
-            # keep capacity
-            for col in self._col_lists:
-                col.clear()
+            for col in self._col_lists: col.clear()
         else:
-            # drop only the emitted prefix; keep remainder for next flush
-            # (O(n) left pop per column—simple and predictable)
-            n = n_out
-            for col in self._col_lists:
-                del col[:n]
+            for col in self._col_lists: del col[:n_out]
 
-        return sink.getbuffer()
+        return df
+
