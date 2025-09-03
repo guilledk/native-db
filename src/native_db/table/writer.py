@@ -259,3 +259,27 @@ class TableWriter:
             number_of_rows=number_of_rows,
             format=format
         ))
+
+    async def stage_frame(
+        self,
+        frame: pl.DataFrame,
+        index: int,
+        *,
+        format: FrameFormats = 'ipc'
+    ) -> None:
+        path = self._table.local_path / '.staging' / f'frame-{index:05d}.{frame.height}.{format}'
+
+        await self._executor.collect(
+            sink_frame(
+                frame.lazy(),
+                path,
+                format=format
+            )
+        )
+
+        await self.stage_direct(StagedFrame.from_push(
+            path,
+            index=index,
+            number_of_rows=frame.height,
+            format=format
+        ))

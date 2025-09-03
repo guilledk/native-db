@@ -15,7 +15,7 @@ from native_db._utils import (
     solve_redirects,
 )
 from native_db.errors import NativeDBError
-from native_db.lowlevel.diskops import FrameFormats
+from native_db.lowlevel.diskops import FrameFormats, scan_frame
 from native_db.schema import Schema, SchemaLike, SchemaMeta
 from native_db.structs import FrozenStruct
 from native_db.table._layout import (
@@ -276,11 +276,6 @@ class Table:
             **kwargs
         )
 
-    # @asynccontextmanager
-    # async def writer(self, **kwargs) -> AsyncGenerator[TableWriter, None]:
-    #     async with open_table_writer(self, self.writer_opts, **kwargs) as w:
-    #         yield w
-
     def empty(self) -> pl.LazyFrame:
         return pl.LazyFrame(schema=self.schema.as_polars())
 
@@ -292,7 +287,7 @@ class Table:
             sorted(
                 p
                 for p in self._local_path.rglob(f'**/{self.file_pattern}')
-                if '.staging' in p.parts
+                if '.staging' not in p.parts
             )
         )
 
@@ -324,8 +319,9 @@ class Table:
 
 
         if self._local_path and self._local_path.exists():
-            frame = pl.scan_ipc(
+            frame = scan_frame(
                 f'{self._local_path}',
+                format=self.format,
                 hive_partitioning=self.partitioning is not None
             )
 
@@ -343,7 +339,7 @@ class Table:
                             self._local_path, self.source,
                             prefix=self.prefix, suffix=self.suffix
                         )
-                        frame = pl.scan_parquet(self._local_path)
+                        frame = scan_frame(self._local_path, format=self.format)
 
                     else:
                         raise NotImplementedError
