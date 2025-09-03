@@ -2,12 +2,20 @@
 Misc internal utilities
 
 '''
+from contextlib import contextmanager
+import os
 
 from datetime import datetime, timezone
-import os
 from pathlib import Path
+import signal
+import threading
+import time
 
+import psutil
 import requests
+
+
+class NativeDBWarning(Warning): ...
 
 
 def utc_now() -> datetime:
@@ -53,16 +61,27 @@ def get_root_datadir() -> Path:
     return Path(os.getenv('NATIVE_DB_DATADIR', default_datadir))
 
 
-def fetch_remote_file(
-    datadir: Path, url: str, *, prefix: str | None, suffix: str | None
-) -> tuple[str, Path]:
-    # perform head requests looking for ETag header with checksum
+def solve_redirects(
+    url: str
+) -> str:
     head = requests.head(url)
 
     # maybe follow location header (redirect)
     if redirect_url := head.headers.get('Location'):
-        head = requests.head(redirect_url)
-        url = redirect_url
+        return redirect_url
+
+    return url
+
+
+def fetch_remote_file(
+    datadir: Path,
+    url: str,
+    *,
+    prefix: str | None,
+    suffix: str | None
+) -> Path:
+    # perform head requests looking for ETag header with checksum
+    head = requests.head(url)
 
     # expect etag checksum
     etag = head.headers.get('ETag')
@@ -79,21 +98,18 @@ def fetch_remote_file(
     etag = etag.strip('"')
 
     # maybe figure out prefix and suffix from url
-    if not prefix or not suffix:
+    if not suffix:
         url_no_params = url.split('?')[0]
         url_filename = url_no_params.split('/')[-1]
         filename_parts = url_filename.split('.')
-
-        pre, suf = filename_parts
-
-        if not prefix:
-            prefix = pre
-
-        if not suffix:
-            suffix = suf
+        suffix = filename_parts[-1]
 
     # finally generate etag based local cache path
-    local_path = datadir / etag / f'{prefix}.{suffix}'
+    fname = f'{etag}.{suffix}'
+    if prefix:
+        fname = '-'.join((prefix, fname))
+
+    local_path = datadir / fname
 
     # if local file missing, attempt download
     if not local_path.is_file():
@@ -106,7 +122,4 @@ def fetch_remote_file(
             for chunk in resp.iter_content(chunk_size=4 * 1024):
                 f.write(chunk)
 
-    return url, local_path
-
-
-class NativeDBWarning(Warning): ...
+    return local_path
