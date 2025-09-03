@@ -47,6 +47,8 @@ import polars as pl
 from polars.datatypes.classes import NumericType, classinstmethod
 from polars._typing import PythonDataType, PolarsDataType
 
+from native_db.structs import FrozenStruct
+
 
 class Keyword(pl.DataType):
     '''
@@ -323,6 +325,8 @@ DTypeTag = Literal[
     'i32',
     'i64',
     'i128',
+    'f32',
+    'f64',
     'decimal',
     'bool',
     'date',
@@ -333,6 +337,10 @@ DTypeTag = Literal[
     'string',  # polars string
     'keyword',  # custom Keyword
     'mono', # custom monotonic
+
+    # nested sequences
+    'list',
+    'array'
 ]
 
 # Maps between runtime dtype classes and tags
@@ -346,6 +354,8 @@ dtype_tag_map: dict[DataTypeExt, DTypeTag] = {
     pl.Int32: 'i32',
     pl.Int64: 'i64',
     pl.Int128: 'i128',
+    pl.Float32: 'f32',
+    pl.Float64: 'f64',
     pl.Decimal: 'decimal',
     pl.Boolean: 'bool',
     pl.Date: 'date',
@@ -356,6 +366,8 @@ dtype_tag_map: dict[DataTypeExt, DTypeTag] = {
     pl.String: 'string',
     Keyword: 'keyword',
     Mono: 'mono',
+    pl.List: 'list',
+    pl.Array: 'array'
 }
 
 # inverse of dtype_tag_map
@@ -364,17 +376,17 @@ tag_dtype_map: dict[DTypeTag, DataTypeExt] = {
 }
 
 
-class DataTypeMeta(msgspec.Struct, frozen=True):
+class DataTypeMeta(FrozenStruct, frozen=True):
     tag: DTypeTag
     kwargs: dict[str, Any] = {}
 
     @staticmethod
     def from_dtype(dtype: DataTypeExt) -> DataTypeMeta:
-        if dtype.is_nested():
-            raise NotImplementedError
-
         kwargs = {}
         match dtype:
+            case Mono():
+                kwargs['size'] = dtype.size
+
             case pl.Decimal():
                 kwargs['precision'] = dtype.precision
                 kwargs['scale'] = dtype.scale
@@ -386,12 +398,28 @@ class DataTypeMeta(msgspec.Struct, frozen=True):
             case pl.Duration():
                 kwargs['time_unit'] = dtype.time_unit
 
-        return DataTypeMeta(tag=dtype_tag_map[dtype], kwargs=kwargs)
+            case pl.List() | pl.Array():
+                kwargs['inner'] = DataTypeMeta.from_dtype(dtype.inner)
+
+            case _ if dtype.is_nested():
+                raise NotImplementedError(f'Only List or Array nested types supported, got: {dtype}')
+
+        return DataTypeMeta(tag=dtype_tag_map[class_of(dtype)], kwargs=kwargs)
 
     def decode(self) -> DataTypeExt:
         cls = tag_dtype_map[self.tag]
 
-        if cls in (pl.Decimal, pl.Datetime, pl.Duration) and self.kwargs:
-            cls = cls(**self.kwargs)
+        match cls:
+            case pl.List | pl.Array:
+                inner_meta = DataTypeMeta.convert(self.kwargs['inner'])
+                cls = cls(inner_meta.decode())
+
+            case _ if cls in (
+                Mono,
+                pl.Decimal,
+                pl.Datetime,
+                pl.Duration
+            ):
+                cls = cls(**self.kwargs)
 
         return cls
