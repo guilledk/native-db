@@ -95,6 +95,7 @@ class RowLenPartitioner(Partitioner):
 
 
 
+
 class MonoPartition(BasePartition, tag='mono', frozen=True):
     row_size: int = 100_000
 
@@ -125,7 +126,11 @@ class MonoPartitioner(Partitioner):
         )
 
 
-TimePartKind = Literal['year', 'month', 'day']
+TimePartKind = Literal[
+    'year', 'month', 'day',
+    'year-month', 'year_month',
+    'year-month-day', 'year_month_day'
+]
 
 
 class TimePartition(BasePartition, tag='time', frozen=True):
@@ -142,16 +147,37 @@ class TimePartitioner(Partitioner):
         self.col = meta.column(table.schema)
         self.plcol = pl.col(self.col.name)
 
-        if not isinstance(self.col.type, TemporalType):
+        if not self.col.type.is_temporal():
             raise InvalidTableLayoutError(
                 'Time partitioner expected column type to be temporal'
             )
 
-        self.by_cols = [meta.kind]
-        self._part_exp: pl.Expr = getattr(self.plcol.dt, meta.kind)().alias(meta.kind)
+        kind = meta.kind.replace('_', '-')
+        if kind in ('year', 'month', 'day'):
+            self.by_cols = [kind]
+            self._part_exprs: list[pl.Expr] = [
+                getattr(self.plcol.dt, kind)().alias(kind)
+            ]
+        elif kind == 'year-month':
+            self.by_cols = ['year', 'month']
+            self._part_exprs = [
+                self.plcol.dt.year().alias('year'),
+                self.plcol.dt.month().alias('month'),
+            ]
+        elif kind == 'year-month-day':
+            self.by_cols = ['year', 'month', 'day']
+            self._part_exprs = [
+                self.plcol.dt.year().alias('year'),
+                self.plcol.dt.month().alias('month'),
+                self.plcol.dt.day().alias('day'),
+            ]
+        else:
+            raise InvalidTableLayoutError(
+                f'Unsupported time partition kind: {meta.kind}'
+            )
 
     def prepare(self, staged: pl.LazyFrame) -> pl.LazyFrame:
-        return staged.with_columns(self._part_exp)
+        return staged.with_columns(*self._part_exprs)
 
 
 class DictionaryPartition(BasePartition, tag='dict', frozen=True):
@@ -233,7 +259,7 @@ class DictionaryPartitioner(Partitioner):
 
 
 PartitionerTypes = (
-    MonoPartitioner | TimePartitioner | DictionaryPartitioner
+    RowLenPartitioner | MonoPartitioner | TimePartitioner | DictionaryPartitioner
 )
 
 PartitionTypes = (
