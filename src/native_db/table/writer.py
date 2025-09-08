@@ -177,7 +177,7 @@ class TableWriter:
                         pl.PartitionParted(
                             commit_root,
                             by=self._part.by_cols,
-                            include_key=True,
+                            include_key=False,
                             per_partition_sort_by=per_part_sort,
                         ),
                         **self._table.sink_args()
@@ -224,7 +224,9 @@ class TableWriter:
 
             self._staged_rows -= commit_rows
             if self._staged_rows < 0: self._staged_rows = 0
-            await self._commit(commit_frames, sub_stage)
+
+            async with self._commit_lock:
+                await self._commit(commit_frames, sub_stage)
 
     async def stage_direct(self, frame: StagedFrame) -> None:
         self._staging[frame.index] = frame
@@ -244,6 +246,8 @@ class TableWriter:
             self._in_order_staging.append(next_frame)
 
         await self._commit_in_chunks(final=True)
+
+        shutil.rmtree(self._table.local_path / '.staging')
 
     async def stage(
         self,

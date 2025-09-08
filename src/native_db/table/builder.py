@@ -166,7 +166,25 @@ class TableBuilder:
 
         df = pl.DataFrame(data, schema=self._table.schema.as_polars())
 
-        # (same nullability + sort logic as before)
+        # validate non-nullability (only for the emitted slice)
+        if self._nonnull_names:
+
+            checks = [
+                pl.col(n).is_null().any().alias(n) for n in self._nonnull_names
+            ]
+
+            null_any = df.select(checks).row(0)
+            for name, has_null in zip(
+                self._nonnull_names, null_any, strict=True
+            ):
+                if has_null:
+                    raise ValueError(
+                        f'Tried to flush non-nullable column {name} with null values'
+                    )
+
+        # maybe sort (only the emitted slice)
+        if self._sort_names:
+            df = df.sort(by=self._sort_names, descending=self._sort_desc)
 
         if consume_all:
             for col in self._col_lists: col.clear()

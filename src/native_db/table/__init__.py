@@ -15,7 +15,7 @@ from native_db._utils import (
     solve_redirects,
 )
 from native_db.errors import NativeDBError
-from native_db.lowlevel.diskops import FrameFormats, scan_frame
+from native_db.lowlevel.diskops import FrameFormats, format_from_path, scan_frame
 from native_db.schema import Schema, SchemaLike, SchemaMeta
 from native_db.structs import FrozenStruct
 from native_db.table._layout import (
@@ -58,7 +58,7 @@ class Table:
         source: str | Path,
         schema: SchemaLike,
         *,
-        format: FrameFormats = 'parquet',
+        format: FrameFormats | None = None,
         compression: str = 'zstd',
         compression_level: int | None = None,
         prefix: str | None = None,
@@ -71,7 +71,7 @@ class Table:
         self.name = name
         self.schema = Schema.from_like(schema)
         self.source = source
-        self.format: FrameFormats = format
+        self.format: FrameFormats = format or format_from_path(source)
         self.compression: str = compression
         self.compression_level = compression_level
 
@@ -223,6 +223,7 @@ class Table:
         name: str | None = None,
         source: str | None = None,
         schema: SchemaLike | None = None,
+        format: FrameFormats | None = None,
         compression: str | None = None,
         compression_level: int | None = None,
         prefix: str | None = None,
@@ -240,6 +241,7 @@ class Table:
         return Table(
             name=name or self.name,
             source=source or self.source,
+            format=format or self.format,
             schema=schema or self.schema,
             compression=compression or self.compression,
             compression_level=compression_level or self.compression_level,
@@ -319,42 +321,58 @@ class Table:
 
         return args
 
+    def scan_args(self) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            'format': self.format,
+        }
+        if self.format != 'csv':
+            args['hive_partitioning'] = self.partitioning is not None
+            # args['include_file_paths'] = True
+
+        return args
+
     def scan(self, *, use_cache: bool = True) -> pl.LazyFrame:
         if use_cache and self._frame is not None:
             return self._frame
 
+        try:
+            if self._local_path and self._local_path.exists():
+                frame = scan_frame(
+                    self._local_path,
+                    **self.scan_args(),
+                )
 
-        if self._local_path and self._local_path.exists():
-            frame = scan_frame(
-                self.files(),
-                format=self.format,
-                hive_partitioning=self.partitioning is not None
-            )
+            else:
+                match self.src_kind:
+                    case 'local':
+                        frame = self.empty()
 
-        else:
-            match self.src_kind:
-                case 'local':
-                    frame = self.empty()
+                    case 'remote':
+                        assert isinstance(self.source, str)
 
-                case 'remote':
-                    assert isinstance(self.source, str)
+                        if self.source.startswith('http'):
+                            self.source = solve_redirects(self.source)
+                            self._local_path = fetch_remote_file(
+                                self._local_path, self.source,
+                                prefix=self.prefix, suffix=self.suffix
+                            )
+                            frame = scan_frame(
+                                self._local_path,
+                                **self.scan_args(),
+                            )
 
-                    if self.source.startswith('http'):
-                        self.source = solve_redirects(self.source)
-                        self._local_path = fetch_remote_file(
-                            self._local_path, self.source,
-                            prefix=self.prefix, suffix=self.suffix
-                        )
-                        frame = scan_frame(self._local_path, format=self.format)
+                        else:
+                            raise NotImplementedError
 
-                    else:
+                    case _:
                         raise NotImplementedError
 
-                case _:
-                    raise NotImplementedError
+        except pl.exceptions.ComputeError:
+            frame = self.empty()
 
         if use_cache:
             self._frame = frame
+            
 
         return frame
 

@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 from typing import IO, Callable, Literal, Protocol, Sequence
+from urllib.parse import urlparse
 
 import polars as pl
 from polars._typing import PartitioningScheme
@@ -24,20 +25,28 @@ def format_from_path(path: str | Path) -> FrameFormats:
     Given a file path figure out its format from the suffix.
 
     '''
-    path = Path(path)
-    splt = path.name.split('.')
+    if isinstance(path, str):
+        if path.startswith('http'):
+             path = Path(urlparse(path).path)
 
-    if splt[-1] == 'tmp':
-        splt.pop()
+        else:
+            path = Path(path)
 
-    match splt[-1]:
+    fname = Path(path).name
+    splt = fname.split('.')
+
+    suffix = splt.pop()
+    if suffix == 'tmp':
+        suffix = splt.pop()
+
+    match suffix:
         case 'csv' | 'ipc' | 'parquet':
-            return splt[-1]
+            return suffix
 
         case _:
             raise ValueError(
                 'Format not specified and target file has unknown suffix:'
-                f' {path.suffix}'
+                f' {suffix}'
             )
 
 
@@ -138,7 +147,7 @@ async def row_lens(
     Get row length of multiple on-disk frames in parallel.
 
     '''
-    all_parquet = not any(Path(p).suffix != 'parquet' for p in paths)
+    all_parquet = all(Path(p).suffix == '.parquet' for p in paths)
     if all_parquet:
         return tuple((
             parquet_row_len(p)
@@ -171,7 +180,7 @@ async def row_len(
     Get row length of an on-disk frame.
 
     '''
-    if path.suffix == 'parquet':
+    if path.suffix == '.parquet':
         return parquet_row_len(path)
 
     frame = (
@@ -259,7 +268,7 @@ async def concat_or_split_frame(
 
     if source_len <= space:
         # target + source rows can fit directly concatenated
-        merged = pl.concat((scan_frame(target), scan_frame(source)), rechunk=False)
+        merged = pl.concat((scan_frame(target), scan_frame(source)), rechunk=False, how='vertical')
         await rewrite_frame(merged, target, executor=executor)
         return False
 

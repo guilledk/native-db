@@ -97,7 +97,7 @@ class Schema:
         columns: Iterable[ColumnLike],
         *,
         row_group_size: int | None = None,
-        target_group_size: int = 128 * 1024 * 1024,
+        target_group_size: int = 64 * 1024 * 1024,
     ):
         self._columns: tuple[Column, ...] = tuple(
             (Column.from_like(c) for c in columns)

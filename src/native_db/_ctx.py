@@ -90,7 +90,11 @@ class Context:
         base = super().__dir__()
         return sorted(set(base) | set(self._table_map) | set(self._tf_map))
 
-    def ensure_cache(self, regen: bool = False) -> None:
+    def ensure_cache(
+        self,
+        regen: bool = False,
+        skip_remotes: bool = False,
+    ) -> None:
         '''
         Ensure all transform & remote caches are present on disk, generate if missing,
         or regenerate all if `regen` == True.
@@ -100,6 +104,9 @@ class Context:
         start = time.perf_counter()
 
         for table in self.tables:
+            if table.src_kind == 'remote' and skip_remotes:
+                continue
+
             self._log.info(
                 f'generating cache for {table.name} at {table.local_path}...'
             )
@@ -108,7 +115,13 @@ class Context:
 
             # materialize and return frame length
             table._frame = None
-            row_count: int = table.scan().select(pl.len()).collect().item()
+            try:
+                # materialize and return frame length
+                row_count: int = table.scan().select(pl.len()).collect().item()
+
+            except pl.exceptions.ComputeError as e:
+                self._log.info(f'cache generation for {table.name} failed, compute error "{e}"... skip.')
+                continue
 
             # start calc with milliseconds
             elapsed = (
@@ -145,7 +158,7 @@ class Context:
                         continue
 
                     else:
-                        transform.cache_path.unlink()
+                        transform.clear_cache()
 
                 if transform.is_cached:
                     continue
@@ -159,14 +172,14 @@ class Context:
 
                 try:
                     # materialize and return frame length
-                    row_count: int = transform.scan().select(pl.len()).collect().item()
+                    row_count: int = transform.scan(ctx=self).select(pl.len()).collect().item()
 
                 except pl.exceptions.ComputeError as e:
                     self._log.info(f'transform generation failed, compute error "{e}"... skip.')
                     continue
 
                 except FileNotFoundError as e:
-                    self._log.info(f'transform generation failed, source "{e.filename}": file not found... skip.')
+                    self._log.info(f'transform generation failed, "{e}"')
                     continue
 
                 # start calc with milliseconds
@@ -424,11 +437,7 @@ class ContextWriter:
 
     async def stage_direct(self, name: str, frame: StagedFrame) -> None:
         state = self._ensure_table(name)
-        try:
-            state.send_chan.send_nowait(frame)
-
-        except anyio.WouldBlock:
-            await state.send_chan.send(frame)
+        await state.send_chan.send(frame)
 
     async def stage(
         self,
