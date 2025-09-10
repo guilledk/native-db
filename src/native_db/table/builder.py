@@ -191,5 +191,8 @@ class TableBuilder:
         else:
             for col in self._col_lists: del col[:n_out]
 
+        if self._table.partitioning:
+            df = self._table.partitioning.prepare(df)
+
         return df
 
