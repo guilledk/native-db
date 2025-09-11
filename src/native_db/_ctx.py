@@ -1,3 +1,4 @@
+import fnmatch
 import os
 import sys
 import time
@@ -7,7 +8,6 @@ from typing import Any, AsyncGenerator, Iterable, Sequence
 from logging import Logger
 from pathlib import Path
 from itertools import count
-from collections import deque
 from contextlib import asynccontextmanager
 
 import anyio
@@ -16,11 +16,11 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 import polars as pl
 
 from native_db.lowlevel import PolarsExecutor
-from native_db.lowlevel.diskops import FrameFormats, sink_frame
+from native_db.lowlevel.diskops import sink_frame
 from native_db.structs import Struct
 from native_db.table import Table, TableLike
 from native_db.table.builder import TableBuilder
-from native_db.table.writer import StagedFrame, TableWriterOptions
+from native_db.table.writer import StagedPart
 from native_db.transform import Transform
 
 
@@ -222,18 +222,20 @@ class ContextBuilder:
         self._executor = executor
         self._builders: dict[str, TableBuilder] = {}
         self._stage_threshold: dict[str, int | None] = {}
-        self._idx_queues: dict[str, deque[tuple[int, FrameFormats, str]]] = {}
-        self._auto_index: dict[str, count[int]] = {}
+        # per-table staging root and commit sequence
+        self._staging_root: dict[str, Path] = {}
+        self._commit_id: dict[str, count[int]] = {}
 
         for table in ctx.tables:
             if table.src_kind != 'local':
                 continue
             thr = table.writer_opts.stage_threshold if table.writer_opts else None
-            # hand the target to the TableBuilder (it will only flush exact slices)
-            self._builders[table.name] = table.builder(target_row_size=thr)  # ← key change
+            self._builders[table.name] = table.builder(target_row_size=thr)
             self._stage_threshold[table.name] = thr
-            self._idx_queues[table.name] = deque()
-            self._auto_index[table.name] = count(0)
+            root = getattr(self._ctx, table.name).local_path / '.staging' / f'pid-{os.getpid()}'
+            root.mkdir(parents=True, exist_ok=True)
+            self._staging_root[table.name] = root
+            self._commit_id[table.name] = count(0)
 
     def append(self, table: str, row: Iterable[Any]) -> None:
         self._builders[table].append(row)
@@ -255,104 +257,105 @@ class ContextBuilder:
     async def stage(
         self,
         *,
-        frame_index: int | None = None,
-        format: FrameFormats = 'ipc',
-        compression: str = 'zstd',
-        allow_underfilled: bool = False,
         drain: bool = False,
-    ) -> dict[str, list[StagedFrame]]:
+    ) -> dict[str, list[StagedPart]]:
         """
-        Queue the provided frame_index for every table; emit only *exactly*
-        sized frames (if a per-table stage_threshold is configured), preserving
-        the user's original index order per table.
-
-        New:
-          - allow_underfilled: if True, underfilled builders are a no-op (keeps order, writes nothing).
-          - drain: if True, after emitting all exact-size frames, also emit ONE final partial remainder.
+        Materialize per-table commits under `.staging/pid-<PID>/commit-<N>/...`
+        writing *partitioned* files ready for integration. No frame indices.
         """
-        staged: dict[str, list[StagedFrame]] = {}
+        staged: dict[str, list[StagedPart]] = {}
         ops: list[pl.LazyFrame] = []
-        to_rename: list[tuple[Path, Path]] = []
+        to_finalize: list[tuple[str, Path, Path]] = []  # (table_name, tmp_dir, final_dir)
 
         for table_name, builder in self._builders.items():
             table = getattr(self._ctx, table_name)
-            target = self._stage_threshold.get(table_name)  # None => no exact sizing
+            target = self._stage_threshold.get(table_name)
+            root = self._staging_root[table_name]
 
-            # 1) queue index (per table; preserves user call order)
-            idxq = self._idx_queues[table_name]
-            idx = frame_index if frame_index is not None else next(self._auto_index[table_name])
-            idxq.append((idx, format, compression))
+            def _prepare_and_queue(df: pl.DataFrame) -> None:
+                commit_id = next(self._commit_id[table_name])
+                tmp = root / f'commit-{commit_id}.tmp'
+                final = root / f'commit-{commit_id}'
+                tmp.mkdir(parents=True, exist_ok=True)
 
-            # 2) emit frames
+                # Add partition keys if needed and sink partitioned.
+                part = table.partitioning
+                lf = df.lazy()
+                if part:
+                    lf = part.prepare(lf)  # derive hive keys from data (e.g. bucket/year...)
+                    # Preserve hinted sorts inside each partition.
+                    sort_cols = [
+                        pl.col(col.name)
+                        for col in table.schema.columns
+                        if col.hints.sort in ("asc", "desc")
+                    ]
+                    scheme = pl.PartitionByKey(
+                        tmp,
+                        by=part.by_cols,
+                        include_key=False,
+                        per_partition_sort_by=sort_cols or [],
+                    )
+                    ops.append(sink_frame(lf, scheme, **table.sink_args()))
+                else:
+                    # Single-file, unpartitioned commit
+                    out = tmp / f"part.{table.format}"
+                    ops.append(sink_frame(lf, out, **table.sink_args()))
+
+                to_finalize.append((table_name, tmp, final))
+
             if target is None:
-                # Legacy behavior: flush whatever we have once (0 rows => skip).
-                # Flags are passed for API symmetry; they only matter when target is set.
-                df = builder.flush_frame(allow_underfilled=allow_underfilled, drain=drain)
-                if df.height == 0:
-                    continue
-                use_idx, fmt, comp = idxq.popleft()
-                stage_path = table.local_path / '.staging' / f'frame-{use_idx:05d}.{df.height}-rows.{fmt}'
-                stage_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = Path(f'{stage_path.resolve()}.tmp')
-                to_rename.append((stage_path, tmp))
-                ops.append(sink_frame(df.lazy(), tmp, compression=comp))
-                staged.setdefault(table_name, []).append(
-                    StagedFrame(index=use_idx, number_of_rows=df.height, path=stage_path, format=fmt)
-                )
+                df = builder.flush_frame(allow_underfilled=False, drain=drain)
+                if df.height > 0:
+                    _prepare_and_queue(df)
                 continue
 
-            # exact-size path: only flush while we have enough rows *and* queued indices
-            while builder.rows() >= target and idxq:
-                df = builder.flush_frame()  # emits exactly `target` rows here
-                use_idx, fmt, comp = idxq.popleft()
-                stage_path = table.local_path / '.staging' / f'frame-{use_idx:05d}.{df.height}-rows.{fmt}'
-                stage_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = Path(f'{stage_path.resolve()}.tmp')
-                to_rename.append((stage_path, tmp))
-                ops.append(sink_frame(df.lazy(), tmp, compression=comp))
-                staged.setdefault(table_name, []).append(
-                    StagedFrame(index=use_idx, number_of_rows=df.height, path=stage_path, format=fmt)
-                )
+            # Emit as many exact-size chunks as available.
+            while builder.rows() >= target:
+                df = builder.flush_frame()
+                _prepare_and_queue(df)
 
-            # If we're draining at end-of-stream, emit the underfilled remainder (once)
+            # On drain, flush final underfilled remainder (once).
             if drain and builder.rows() > 0:
-                df = builder.flush_frame(drain=True)  # remainder < target
+                df = builder.flush_frame(drain=True)
                 if df.height > 0:
-                    if idxq:
-                        use_idx, fmt, comp = idxq.popleft()
-                    else:
-                        # fallback: allocate a fresh index if none were queued for this table
-                        use_idx = next(self._auto_index[table_name])
-                        fmt, comp = format, compression
-                    stage_path = table.local_path / '.staging' / f'frame-{use_idx:05d}.{df.height}-rows.{fmt}'
-                    stage_path.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = Path(f'{stage_path.resolve()}.tmp')
-                    to_rename.append((stage_path, tmp))
-                    ops.append(sink_frame(df.lazy(), tmp, compression=comp))
-                    staged.setdefault(table_name, []).append(
-                        StagedFrame(index=use_idx, number_of_rows=df.height, path=stage_path, format=fmt)
-                    )
+                    _prepare_and_queue(df)
 
         if not ops:
-            # nothing to write this round
             return {}
 
+        # Execute all sinks, then flip tmp -> final atomically per-commit.
         await self._executor.collect_all(ops)
-        for final, tmp in to_rename:
-            os.rename(tmp, final)
+        for _table_name, tmp, final in to_finalize:
+            os.replace(tmp, final)
 
-        # normalize value type for convenience (StagedFrame | list[StagedFrame])
-        return {
-            name: frames
-            for name, frames in staged.items()
-        }
+        # Walk commits and emit StagedPart records for the writer(s).
+        for table_name, _tmp, commit_root in to_finalize:
+            table = getattr(self._ctx, table_name)
+            parts: list[StagedPart] = []
+            for dirpath, _dirs, files in os.walk(commit_root):
+                for name in files:
+                    if fnmatch.fnmatch(name, table.file_pattern):
+                        p = Path(dirpath) / name
+                        rel_parent = Path(dirpath).relative_to(commit_root)
+                        parts.append(
+                            StagedPart(
+                                path=p,
+                                rel_parent=rel_parent,
+                                commit_root=commit_root,
+                                format=table.format,
+                            )
+                        )
+            if parts:
+                staged.setdefault(table_name, []).extend(parts)
+
+        return staged
 
 
 
 class _WriterState(Struct):
     table: 'Table'
-    send_chan: MemoryObjectSendStream[StagedFrame]
-    recv_chan: MemoryObjectReceiveStream[StagedFrame]
+    send_chan: MemoryObjectSendStream[StagedPart]
+    recv_chan: MemoryObjectReceiveStream[StagedPart]
 
 
 def _excepthook(exc_type, exc, tb):
@@ -377,7 +380,6 @@ class ContextWriter:
         ctx: Context,
         tg: anyio.abc.TaskGroup,
         *,
-        start_frame_index: int = 1,
         log: Logger | None = None,
         executor: PolarsExecutor | None = None
     ) -> None:
@@ -392,17 +394,9 @@ class ContextWriter:
             if table.src_kind != 'local':
                 continue
 
-            schan, rchan = anyio.create_memory_object_stream[StagedFrame](1)
+            schan, rchan = anyio.create_memory_object_stream[StagedPart](1)
             self._writers[table.name] = _WriterState(
-                table=(
-                    table.copy(
-                        writer_opts=TableWriterOptions.from_other(
-                            table.writer_opts,
-                            start_frame_index=start_frame_index
-                        )
-                    )
-                    if table.writer_opts else table
-                ),
+                table=table,
                 send_chan=schan,
                 recv_chan=rchan,
             )
@@ -435,81 +429,29 @@ class ContextWriter:
         for wstate in self._writers.values():
             await wstate.send_chan.aclose()
 
-    async def stage_direct(self, name: str, frame: StagedFrame) -> None:
+    async def stage_direct(self, name: str, frame: StagedPart) -> None:
         state = self._ensure_table(name)
         await state.send_chan.send(frame)
 
-    async def stage(
-        self,
-        name: str,
-        path: str | Path,
-        *,
-        index: int | None = None,
-        number_of_rows: int = 0,
-        format: FrameFormats | None = None
-    ) -> None:
-        await self.stage_direct(
-            name,
-            StagedFrame.from_push(
-                path=path,
-                index=index,
-                number_of_rows=number_of_rows,
-                format=format
-            )
-        )
-
     async def stage_all(
         self,
-        row_sets: dict[str, list[StagedFrame]]
+        row_sets: dict[str, list[StagedPart]]
     ) -> None:
         async with self._stage_limit:
             for name, frames in row_sets.items():
                 for frame in frames:
                     self._tg.start_soon(self.stage_direct, name, frame)
 
-    async def stage_frame(
-        self,
-        name: str,
-        frame: pl.DataFrame,
-        index: int,
-        *,
-        format: FrameFormats = 'ipc'
-    ) -> None:
-        table = getattr(self.ctx, name)
-        path = table.local_path / '.staging' / f'frame-{index:05d}.{frame.height}.{format}'
-
-        sinkop = sink_frame(
-            frame.lazy(),
-            path,
-            format=format
-        )
-
-        if self._executor:
-            await self._executor.collect(sinkop)
-
-        else:
-            await sinkop.collect_async()
-
-        await self.stage(
-            name,
-            path,
-            index=index,
-            number_of_rows=frame.height,
-            format=format
-        )
-
 @asynccontextmanager
 async def open_ctx_writer(
     ctx: Context,
     *,
-    start_frame_index: int = 0,
     executor: PolarsExecutor | None = None
 ) -> AsyncGenerator[ContextWriter, None]:
     async with anyio.create_task_group() as tg:
         w = ContextWriter(
             ctx,
             tg,
-            start_frame_index=start_frame_index,
             executor=executor
         )
         yield w

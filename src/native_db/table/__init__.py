@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncGenerator, Literal
+from typing import Any, Literal
 
 import msgspec
 import polars as pl
