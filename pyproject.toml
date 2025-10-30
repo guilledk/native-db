@@ -60,7 +60,7 @@ docstring-quotes = 'single'
 
 [tool.uv.sources.hotbaud]
 git = 'https://github.com/guilledk/hotbaud.git'
-rev = '59f48e4fd20776b79978a582ca2bfe19f6313a32'
+rev = '28cb6a80f41c7a35dd28bf5c24795a897a22dcfe'
 
 # [tool.uv.sources.hotbaud]
 # path = '../hotbaud'

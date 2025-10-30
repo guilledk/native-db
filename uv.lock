@@ -161,7 +161,7 @@ wheels = [
 [[package]]
 name = "hotbaud"
 version = "0.1.0"
-source = { git = "https://github.com/guilledk/hotbaud.git?rev=59f48e4fd20776b79978a582ca2bfe19f6313a32#59f48e4fd20776b79978a582ca2bfe19f6313a32" }
+source = { git = "https://github.com/guilledk/hotbaud.git?rev=28cb6a80f41c7a35dd28bf5c24795a897a22dcfe#28cb6a80f41c7a35dd28bf5c24795a897a22dcfe" }
 dependencies = [
     { name = "anyio", extra = ["trio"] },
     { name = "cffi" },
@@ -244,7 +244,7 @@ dev = [
 requires-dist = [
     { name = "anyio", extras = ["trio"], specifier = ">=4.10.0" },
     { name = "colorlog", specifier = ">=6.9.0" },
-    { name = "hotbaud", git = "https://github.com/guilledk/hotbaud.git?rev=59f48e4fd20776b79978a582ca2bfe19f6313a32" },
+    { name = "hotbaud", git = "https://github.com/guilledk/hotbaud.git?rev=28cb6a80f41c7a35dd28bf5c24795a897a22dcfe" },
     { name = "msgspec", specifier = ">=0.19.0" },
     { name = "polars", specifier = ">=1.32.3" },
     { name = "pyarrow", specifier = ">=21.0.0" },
