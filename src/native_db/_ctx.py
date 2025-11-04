@@ -216,6 +216,7 @@ class ContextBuilder:
         self,
         ctx: Context,
         *,
+        table_whitelist: list[str] | None = None,
         executor: PolarsExecutor = PolarsExecutor()
     ):
         self._ctx = ctx
@@ -227,6 +228,9 @@ class ContextBuilder:
         self._commit_id: dict[str, count[int]] = {}
 
         for table in ctx.tables:
+            if table_whitelist and not (table.name in table_whitelist):
+                continue
+
             if table.src_kind != 'local':
                 continue
             thr = table.writer_opts.stage_threshold if table.writer_opts else None
