@@ -57,7 +57,7 @@ class Table:
         source: str | Path,
         schema: SchemaLike,
         *,
-        format: FrameFormats | None = None,
+        format: FrameFormats | None = 'parquet',
         compression: str = 'zstd',
         compression_level: int | None = None,
         prefix: str | None = None,

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Iterable, TYPE_CHECKING
 
 import polars as pl
 from polars._typing import PythonDataType
 
 from native_db.lowlevel.bloom import DiskBloom
+from native_db.lowlevel.diskops import sink_frame
 
 
 if TYPE_CHECKING:
@@ -193,3 +195,27 @@ class TableBuilder:
 
         return df
 
+    def prepare_sink(self, frame: pl.DataFrame, target: Path) -> pl.LazyFrame:
+        # Add partition keys if needed and sink partitioned.
+        part = self._table.partitioning
+        lf = frame.lazy()
+        if part:
+            lf = part.prepare(lf)  # derive hive keys from data (e.g. bucket/year...)
+            # Preserve hinted sorts inside each partition.
+            sort_cols = [
+                pl.col(col.name)
+                for col in self._table.schema.columns
+                if col.hints.sort in ("asc", "desc")
+            ]
+            scheme = pl.PartitionByKey(
+                target,
+                by=part.by_cols,
+                include_key=False,
+                per_partition_sort_by=sort_cols or [],
+            )
+            return sink_frame(lf, scheme, **self._table.sink_args())
+
+        else:
+            # Single-file, unpartitioned commit
+            out = target / f"part.{self._table.format}"
+            return sink_frame(lf, out, **self._table.sink_args())
