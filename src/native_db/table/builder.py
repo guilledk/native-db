@@ -201,17 +201,31 @@ class TableBuilder:
         lf = frame.lazy()
         if part:
             lf = part.prepare(lf)  # derive hive keys from data (e.g. bucket/year...)
-            # Preserve hinted sorts inside each partition.
-            sort_cols = [
-                pl.col(col.name)
-                for col in self._table.schema.columns
-                if col.hints.sort in ("asc", "desc")
+
+            sort_names: list[str] = []
+            sort_desc: list[bool] = []
+            for col in self._table.schema.columns:
+                if col.hints.sort == 'asc':
+                    sort_names.append(col.name)
+                    sort_desc.append(False)
+                elif col.hints.sort == 'desc':
+                    sort_names.append(col.name)
+                    sort_desc.append(True)
+
+            sort_extra: list[tuple[str, bool]] = [
+                (n, d)
+                for n, d in zip(sort_names, sort_desc, strict=True)
+                if n not in part.by_cols
             ]
-            scheme = pl.PartitionByKey(
+            if sort_extra:
+                by = list(part.by_cols) + [n for n, _ in sort_extra]
+                desc = [False] * len(part.by_cols) + [d for _, d in sort_extra]
+                lf = lf.sort(by=by, descending=desc)
+
+            scheme = pl.PartitionBy(
                 target,
-                by=part.by_cols,
                 include_key=False,
-                per_partition_sort_by=sort_cols or [],
+                key=part.by_cols,
             )
             return sink_frame(lf, scheme, **self._table.sink_args())
 
