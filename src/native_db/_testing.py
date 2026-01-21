@@ -1,27 +1,48 @@
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import random
-from typing import Generator, Literal
+from typing import Generator, Literal, Protocol
 
 import polars as pl
 
+from native_db._ctx import Context
 from native_db._utils import epoch
 from native_db.dtypes import Keyword, Mono, TypeHints
 from native_db.table import Table
 from native_db.table._layout import DictionaryPartition, MonoPartition, TimePartition
+from native_db.table.writer import TableWriterOptions
+from native_db.transform import Transform
 
 
-block_table = Table(
-    'block',
-    'static/blocks',
-    (
-        ('number', Mono(size=4), TypeHints(sort='asc')),
-        ('timestamp', pl.Datetime(time_unit='us', time_zone='UTC')),
-        ('hash', Keyword, TypeHints(avg_str_size=64)),
-    ),
-    datadir=Path(__file__).parent.parent.parent / 'tests/.test-db',
-    partitioning=MonoPartition(on_column='number')
-)
+class BlockchainContext(Protocol):
+    tables: tuple[Table, ...]
+    transforms: tuple[Transform, ...]
+
+    # tables
+    blocks: Table
+
+    def ensure_cache(self, regen: bool = False) -> None: ...
+
+
+def blockchain_ctx(datadir: Path) -> BlockchainContext:
+    ctx = Context(
+        datadir=datadir,
+        tables=(
+            Table(
+                'blocks',
+                'static/blocks',
+                (
+                    ('number', Mono(size=4), TypeHints(sort='asc')),
+                    ('timestamp', pl.Datetime(time_unit='us', time_zone='UTC')),
+                    ('hash', Keyword, TypeHints(avg_str_size=64)),
+                ),
+                partitioning=MonoPartition(on_column='number')
+            ),
+        ),
+        transforms=()
+    )
+
+    return ctx  # type: ignore
 
 
 block_time_step = timedelta(seconds=0.5)
@@ -59,29 +80,26 @@ def block_frame_stream(
     seed: int | None = None,
     # limit how "wild" out-of-order can be (windowed shuffle)
     max_reorder_window: int | None = None,
-) -> Generator[tuple[pl.DataFrame, int], None, None]:
+) -> Generator[tuple[list, int], None, None]:
     '''
     Yield batches as (DataFrame, frame_index).
     - order='ordered': emit in natural increasing frame order.
     - order='out_of_order': emit in shuffled order (optionally bounded).
 
     '''
-    schema = block_table.schema.as_polars()
     # 1. Build all batches
     rows_iter = block_stream(start_number, end_number, start_date, time_step)
-    batches: list[tuple[pl.DataFrame, int]] = []
+    batches: list[tuple[list, int]] = []
     idx = 0
     buf = []
     for r in rows_iter:
         buf.append(r)
         if len(buf) == batch_size:
-            df = pl.DataFrame(buf, orient='row', schema=schema)
-            batches.append((df, idx))
+            batches.append((buf, idx))
             idx += 1
             buf = []
     if buf:
-        df = pl.DataFrame(buf, orient='row', schema=schema)
-        batches.append((df, idx))
+        batches.append((buf, idx))
 
     # 2. Decide emission order
     if order == 'ordered' or len(batches) <= 1:
@@ -104,18 +122,46 @@ def block_frame_stream(
     for i in emit_order:
         yield batches[i]
 
+class PubmedContext(Protocol):
+    tables: tuple[Table, ...]
+    transforms: tuple[Transform, ...]
 
-pubmed_table = Table(
-    'pubmed',
-    'static/pubmed',
-    (
-        ('pmid', Mono(size=8), TypeHints(sort='asc')),
-        ('pub_date', pl.Date),
-        ('title', pl.String, TypeHints(avg_str_size=128)),
-    ),
-    datadir=Path(__file__).parent.parent / 'tests/.test-db',
-    partitioning=MonoPartition(on_column='pmid')
-)
+    # tables
+    pubmed: Table
+    authors: Table
+
+    def ensure_cache(self, regen: bool = False) -> None: ...
+
+
+def pubmed_ctx(datadir: Path) -> PubmedContext:
+    ctx = Context(
+        datadir=datadir,
+        tables=(
+            Table(
+                'articles',
+                'static/pubmed',
+                (
+                    ('pmid', Mono(size=8), TypeHints(sort='asc')),
+                    ('pub_date', pl.Date),
+                    ('title', pl.String, TypeHints(avg_str_size=128)),
+                ),
+                partitioning=MonoPartition(on_column='pmid')
+            ),
+            Table(
+                'authors',
+                'static/pubmed_author',
+                (
+                    ('name', Keyword),
+                    ('pmid', Mono(size=8), TypeHints(sort='asc')),
+                ),
+                partitioning=DictionaryPartition(on_column='name', depth=1),
+                writer_opts=TableWriterOptions(commit_threshold=100, rows_per_file=50)
+            )
+        ),
+        transforms=()
+    )
+
+    return ctx  # type: ignore
 
 
 def pubmed_frame_stream(
@@ -123,7 +169,7 @@ def pubmed_frame_stream(
     # list of (start, end) inclusive ranges, emitted in order; gaps may exist between ranges
     ranges: list[tuple[int, int]],
     batch_size: int,
-) -> Generator[tuple[pl.DataFrame, int], None, None]:
+) -> Generator[tuple[list, int], None, None]:
     '''
     Yield (DataFrame, frame_index) batches representing a set of ordered pmid ranges,
     preserving local order and allowing gaps across ranges.
@@ -132,7 +178,6 @@ def pubmed_frame_stream(
     - Titles are synthetic; pub_date increments daily for determinism.
 
     '''
-    schema = pubmed_table.schema.as_polars()
     rows: list[tuple[int, date, str]] = []
 
     # deterministic dates/titles
@@ -142,34 +187,20 @@ def pubmed_frame_stream(
             rows.append((pmid, cur_date, f'title-{pmid}'))
             cur_date = cur_date + timedelta(days=1)
 
-    batches: list[tuple[pl.DataFrame, int]] = []
+    batches: list[tuple[list, int]] = []
     idx = 0
     buf: list[tuple[int, date, str]] = []
     for r in rows:
         buf.append(r)
         if len(buf) == batch_size:
-            df = pl.DataFrame(buf, orient='row', schema=schema)
-            batches.append((df, idx))
+            batches.append((buf, idx))
             idx += 1
             buf = []
     if buf:
-        df = pl.DataFrame(buf, orient='row', schema=schema)
-        batches.append((df, idx))
+        batches.append((buf, idx))
 
     for b in batches:
         yield b
-
-
-pubmed_author_table = Table(
-    'pubmed_author',
-    'static/pubmed_author',
-    (
-        ('name', Keyword),
-        ('pmid', Mono(size=8), TypeHints(sort='asc')),
-    ),
-    datadir=Path(__file__).parent.parent / 'tests/.test-db',
-    partitioning=DictionaryPartition(on_column='name', depth=1),
-)
 
 
 def pubmed_author_random_frame_stream(
@@ -179,7 +210,7 @@ def pubmed_author_random_frame_stream(
     seed: int = 123,
     authors: list[str] | None = None,
     pmid_start: int = 1,
-) -> Generator[tuple[pl.DataFrame, int], None, None]:
+) -> Generator[tuple[list, int], None, None]:
     """
     Yield (DataFrame, frame_index) batches matching pubmed_author_table's schema.
 
@@ -190,8 +221,6 @@ def pubmed_author_random_frame_stream(
     if not authors:
         # keep ASCII-ish to avoid unicode slicing surprises in tests
         authors = ['Alice', 'Bob', 'Charlie', 'Dan', 'Eve', 'Mallory', 'Oscar']
-
-    schema = pubmed_author_table.schema.as_polars()
 
     rows: list[tuple[str, int]] = []
     pmid = pmid_start
@@ -205,26 +234,44 @@ def pubmed_author_random_frame_stream(
     for r in rows:
         buf.append(r)
         if len(buf) == batch_size:
-            yield pl.DataFrame(buf, orient='row', schema=schema), idx
+            yield buf, idx
             idx += 1
             buf = []
     if buf:
-        yield pl.DataFrame(buf, orient='row', schema=schema), idx
+        yield buf, idx
 
 
-market_table = Table(
-    'market',
-    'static/market',
-    (
-        ('time', pl.Datetime(time_unit='ms', time_zone='UTC')),
-        ('open', pl.Float64),
-        ('high', pl.Float64),
-        ('low', pl.Float64),
-        ('close', pl.Float64),
-    ),
-    datadir=Path(__file__).parent.parent / 'tests/.test-db',
-    partitioning=TimePartition(on_column='time'),
-)
+class MarketContext(Protocol):
+    tables: tuple[Table, ...]
+    transforms: tuple[Transform, ...]
+
+    # tables
+    market: Table
+
+    def ensure_cache(self, regen: bool = False) -> None: ...
+
+
+def market_ctx(datadir: Path) -> MarketContext:
+    ctx = Context(
+        datadir=datadir,
+        tables=(
+            Table(
+                'market',
+                'static/market',
+                (
+                    ('time', pl.Datetime(time_unit='ms', time_zone='UTC')),
+                    ('open', pl.Float64),
+                    ('high', pl.Float64),
+                    ('low', pl.Float64),
+                    ('close', pl.Float64),
+                ),
+                partitioning=TimePartition(on_column='time'),
+            ),
+        ),
+        transforms=()
+    )
+
+    return ctx  # type: ignore
 
 
 def market_frame_stream(
@@ -236,7 +283,7 @@ def market_frame_stream(
     seed: int = 42,
     start_price: float = 100.0,
     vol: float = 0.75,
-) -> Generator[tuple[pl.DataFrame, int], None, None]:
+) -> Generator[tuple[list, int], None, None]:
     '''
     Stream synthetic OHLC bars for the *market_table* schema in batches.
 
@@ -264,16 +311,14 @@ def market_frame_stream(
         last_close = c
         t = t + step
 
-    schema = market_table.schema.as_polars()
-
     # batch
     buf = []
     idx = 0
     for r in rows:
         buf.append(r)
         if len(buf) == batch_size:
-            yield pl.DataFrame(buf, orient="row", schema=schema), idx
+            yield buf, idx
             idx += 1
             buf = []
     if buf:
-        yield pl.DataFrame(buf, orient="row", schema=schema), idx
+        yield buf, idx

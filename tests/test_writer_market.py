@@ -1,25 +1,26 @@
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Generator, Tuple
+from typing import Generator
 
 import polars as pl
 import pytest
 
-from native_db._testing import market_table, market_frame_stream
+from native_db._ctx import Context, ContextBuilder, open_ctx_writer
+from native_db._testing import MarketContext, market_ctx, market_frame_stream
 from native_db.table import Table
 from native_db.table._layout import TimePartKind, TimePartition
 from native_db.table.writer import TableWriterOptions
 
 
-def _mk_table(
+def _mk_ctx(
     tmp_path: Path, kind: TimePartKind,
     rows_per_file: int,
     commit_threshold: int
-) -> Table:
+) -> MarketContext:
     # copy the catalog entry, but point to a fresh datadir and desired partition kind
-    t = market_table.copy(
-        datadir=tmp_path,
+    ctx = market_ctx(tmp_path)
+    t = ctx.market.copy(
         partitioning=TimePartition(on_column='time', kind=kind),
         writer_opts=TableWriterOptions(
             rows_per_file=rows_per_file, commit_threshold=commit_threshold
@@ -33,20 +34,29 @@ def _mk_table(
             else:
                 p.rmdir()
         t.local_path.rmdir()
-    return t
+    return Context(
+        datadir=tmp_path,
+        tables=(t, ),
+        transforms=tuple()
+    )  # type: ignore
 
 
 async def _write_stream(
-    table: Table,
-    frames: Generator[Tuple[pl.DataFrame, int], None, None],
+    ctx: MarketContext,
+    row_stream: Generator[tuple[list, int], None, None],
 ) -> None:
-    writer = table.writer()
-    for df, i in frames:
-        await writer.stage_frame(df, i)
+    builder = ContextBuilder(ctx)
+    for rows, i in row_stream:
+        builder.extend('market', rows)
 
-    await writer.drain()
+    staged = await builder.stage(drain=True)
 
-    staging_dir = table.local_path / '.staging'
+    async with open_ctx_writer(ctx) as writer:
+        for table_name, frames in staged.items():
+            for frame in frames:
+                await writer.stage_direct(table_name, frame)
+
+    staging_dir = ctx.market.local_path / '.staging'
     staged_ipcs = list(staging_dir.glob('*.ipc'))
     # drain should leave no frames in staging area
     assert not staged_ipcs
@@ -125,7 +135,7 @@ async def test_time_partitioning_market_table(
     # choose sizes so total rows is a multiple of commit_threshold -> staging empties completely
     rows_per_file = 50
     commit_threshold = 200
-    table = _mk_table(tmp_path / '.test-db', kind, rows_per_file, commit_threshold)
+    ctx = _mk_ctx(tmp_path / '.test-db', kind, rows_per_file, commit_threshold)
     total = periods
     # if periods not divisible, bump it up so test is robust
     if total % commit_threshold != 0:
@@ -142,14 +152,14 @@ async def test_time_partitioning_market_table(
     )
 
     await _write_stream(
-        table,
+        ctx,
         frames,
     )
 
     # expected set of partition directories present
     exp = _expected_partitions(kind, start, total, step)
-    got = _list_partitions(table.local_path)
+    got = _list_partitions(ctx.market.local_path)
     assert exp == got, f'expected partitions {exp}, got {got}'
 
     # per-partition correctness (rows obey the time bucket)
-    _assert_partition_values(table, kind)
+    _assert_partition_values(ctx.market, kind)

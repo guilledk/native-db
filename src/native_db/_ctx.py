@@ -282,28 +282,7 @@ class ContextBuilder:
                 final = root / f'commit-{commit_id}'
                 tmp.mkdir(parents=True, exist_ok=True)
 
-                # Add partition keys if needed and sink partitioned.
-                part = table.partitioning
-                lf = df.lazy()
-                if part:
-                    lf = part.prepare(lf)  # derive hive keys from data (e.g. bucket/year...)
-                    # Preserve hinted sorts inside each partition.
-                    sort_cols = [
-                        pl.col(col.name)
-                        for col in table.schema.columns
-                        if col.hints.sort in ("asc", "desc")
-                    ]
-                    scheme = pl.PartitionByKey(
-                        tmp,
-                        by=part.by_cols,
-                        include_key=False,
-                        per_partition_sort_by=sort_cols or [],
-                    )
-                    ops.append(sink_frame(lf, scheme, **table.sink_args()))
-                else:
-                    # Single-file, unpartitioned commit
-                    out = tmp / f"part.{table.format}"
-                    ops.append(sink_frame(lf, out, **table.sink_args()))
+                ops.append(builder.prepare_sink(df, tmp))
 
                 to_finalize.append((table_name, tmp, final))
 
