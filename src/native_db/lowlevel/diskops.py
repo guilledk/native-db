@@ -3,15 +3,17 @@ import fnmatch
 import logging
 import os
 from pathlib import Path
-from typing import IO, Callable, Literal, Protocol, Sequence
+from typing import IO, Callable, Literal, Protocol, Sequence, TypeAlias
 from urllib.parse import urlparse
 
 import polars as pl
-from polars._typing import PartitioningScheme
 
 import pyarrow.parquet as pq
 
 from native_db.lowlevel import PolarsExecutor
+
+
+PartitioningScheme: TypeAlias = pl.PartitionBy
 
 
 log = logging.getLogger(__name__)

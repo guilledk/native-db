@@ -94,13 +94,20 @@ class Transform:
                 tmp_dir = self.cache_path.with_name(self.cache_path.name + ".tmp")
                 if tmp_dir.exists():
                     import shutil; shutil.rmtree(tmp_dir, ignore_errors=True)
+
+                if self.per_partition_sort_by:
+                    sort_by = list(self.partition_by)
+                    for c in self.per_partition_sort_by:
+                        if c not in sort_by:
+                            sort_by.append(c)
+                    lf = lf.sort(by=sort_by)
+
                 res = sink_frame(
                     lf,
-                    pl.PartitionByKey(
+                    pl.PartitionBy(
                         tmp_dir,
-                        by=self.partition_by,
                         include_key=self.include_key,
-                        per_partition_sort_by=[pl.col(c) for c in self.per_partition_sort_by],
+                        key=self.partition_by,
                     ),
                     format='parquet',
                     **self.sink_args,
