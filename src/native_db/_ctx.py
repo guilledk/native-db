@@ -433,14 +433,15 @@ class ContextWriter:
         state = self._ensure_table(name)
         await state.send_chan.send(frame)
 
-    async def stage_all(
-        self,
-        row_sets: dict[str, list[StagedPart]]
-    ) -> None:
+    async def stage_all(self, row_sets: dict[str, list[StagedPart]]) -> None:
+        # Send synchronously with natural back-pressure. Avoids losing parts if
+        # the stage is canceled immediately after this method returns.
         async with self._stage_limit:
             for name, frames in row_sets.items():
+                state = self._ensure_table(name)
                 for frame in frames:
-                    self._tg.start_soon(self.stage_direct, name, frame)
+                    await state.send_chan.send(frame)
+
 
 @asynccontextmanager
 async def open_ctx_writer(

@@ -125,5 +125,29 @@ class TableWriter:
                 self._commit_refcnt[part.commit_root] = left
 
     async def drain(self) -> None:
-        # Best-effort cleanup of the whole staging area on close.
+        # If staging dir doesn't exist, nothing to do.
+        if not self._staging_path.exists():
+            return
+
+        # 1) Promote any half-written commits (…/commit-*.tmp -> …/commit-*)
+        for tmp in sorted(self._staging_path.rglob("commit-*.tmp")):
+            try:
+                os.replace(tmp, tmp.with_suffix(""))  # atomic-ish dir rename
+            except FileNotFoundError:
+                pass
+
+        # 2) Integrate all orphan commit parts we can find.
+        for commit_root in sorted(self._staging_path.rglob("commit-*")):
+            try:
+                for dirpath, _dirs, files in os.walk(commit_root):
+                    for name in files:
+                        if fnmatch.fnmatch(name, self._table.file_pattern):
+                            p = Path(dirpath) / name
+                            rel_parent = Path(dirpath).relative_to(commit_root)
+                            bucket = self._table.local_path / rel_parent
+                            await self._frame_into_bucket(p, bucket)
+            finally:
+                shutil.rmtree(commit_root, ignore_errors=True)
+
+        # 3) Best-effort full cleanup (blooms, strays).
         shutil.rmtree(self._staging_path, ignore_errors=True)
