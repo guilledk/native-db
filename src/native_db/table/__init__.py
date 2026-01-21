@@ -330,7 +330,7 @@ class Table:
 
         return args
 
-    def scan(self, *, use_cache: bool = True) -> pl.LazyFrame:
+    def scan(self, *, use_cache: bool = True, **kwargs) -> pl.LazyFrame:
         if use_cache and self._frame is not None:
             return self._frame
 
@@ -339,6 +339,7 @@ class Table:
                 frame = scan_frame(
                     self._local_path,
                     **self.scan_args(),
+                    **kwargs
                 )
 
             else:
