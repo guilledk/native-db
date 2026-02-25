@@ -129,11 +129,59 @@ class PubmedContext(Protocol):
     # tables
     pubmed: Table
     authors: Table
+    articles: Table
+    references: Table
+    # transforms
+    article_citations: Transform
 
     def ensure_cache(self, regen: bool = False) -> None: ...
 
+def article_citations_cache_init(ctx: PubmedContext) -> pl.LazyFrame:
+    max_b_cached = 0
+    if ctx.article_citations.cache_path.exists():
+        max_b_cached = (
+            ctx.article_citations.scan(ctx)
+            .select('bucket_id')
+            .max()
+            .collect()
+            .item()
+        )
+
+    return (
+        ctx.references.scan(use_cache=False)
+        .group_by("cited_pmid")
+        .agg(
+            pl.len().alias('n_cites'),
+            pl.col('bucket_id').max().alias('bucket_id'),
+        )
+        .rename({'cited_pmid': 'pmid'})
+        .filter(pl.col('bucket_id').gt(max_b_cached))
+        .sort('pmid')
+    )
+
+def article_citations_cache_checker(ctx: PubmedContext | None = None) -> bool:
+    if ctx is None:
+        return False
+
+    if not ctx.article_citations.cache_path.exists():
+        return False
+
+    return (
+        ctx.article_citations
+        .scan(ctx)
+        .select(pl.col('bucket_id').max())
+        .collect()
+        .item()
+    ) == (
+        ctx.references
+        .scan(use_cache=False)
+        .select(pl.col('bucket_id').max())
+        .collect()
+        .item()
+    )
 
 def pubmed_ctx(datadir: Path) -> PubmedContext:
+    cache_dir = datadir / 'cache'
     ctx = Context(
         datadir=datadir,
         tables=(
@@ -156,9 +204,38 @@ def pubmed_ctx(datadir: Path) -> PubmedContext:
                 ),
                 partitioning=DictionaryPartition(on_column='name', depth=1),
                 writer_opts=TableWriterOptions(commit_threshold=100, rows_per_file=50)
-            )
+            ),
+            Table(
+                name='references',
+                source='static/references',
+                schema=(
+                    ('cited_pmid', Mono(size=8), TypeHints(sort='asc')),
+                    ('citing_pmid', Mono(size=8), TypeHints(sort='asc')),
+                    ('bucket_id',  pl.UInt32),
+                ),
+                format='parquet',
+                partitioning=MonoPartition(
+                    on_column='cited_pmid', row_size=1_000_000
+                ),
+                writer_opts=TableWriterOptions(
+                    commit_threshold=100, rows_per_file=50
+               ),
+            ),
         ),
-        transforms=()
+        transforms=(
+            (
+                # materialize number of citations per article
+                # (reverse citations graph edges)
+                Transform(
+                    name='article_citations',
+                    query=article_citations_cache_init,
+                    cache_path=cache_dir
+                    / 'article_citations.parquet',
+                    is_cached=article_citations_cache_checker,
+                    primary_key='pmid',
+                )
+            ),
+        ),
     )
 
     return ctx  # type: ignore
