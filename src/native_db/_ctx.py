@@ -15,6 +15,8 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 
 import polars as pl
 
+from polars.type_aliases import EngineType
+
 from native_db.lowlevel import PolarsExecutor
 from native_db.lowlevel.diskops import sink_frame
 from native_db.structs import Struct
@@ -94,6 +96,7 @@ class Context:
         self,
         regen: bool = False,
         skip_remotes: bool = False,
+        engine: EngineType = 'streaming'
     ) -> None:
         '''
         Ensure all transform & remote caches are present on disk, generate if missing,
@@ -117,7 +120,7 @@ class Context:
             table._frame = None
             try:
                 # materialize and return frame length
-                row_count: int = table.scan().select(pl.len()).collect().item()
+                row_count: int = table.scan().select(pl.len()).collect(engine=engine).item()
 
             except pl.exceptions.ComputeError as e:
                 self._log.info(f'cache generation for {table.name} failed, compute error "{e}"... skip.')
@@ -172,7 +175,7 @@ class Context:
 
                 try:
                     # materialize and return frame length
-                    row_count: int = transform.scan(ctx=self).select(pl.len()).collect().item()
+                    row_count: int = transform.scan(ctx=self).select(pl.len()).collect(engine=engine).item()
 
                 except pl.exceptions.ComputeError as e:
                     self._log.info(f'transform generation failed, compute error "{e}"... skip.')
