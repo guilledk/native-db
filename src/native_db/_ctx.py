@@ -149,7 +149,7 @@ class Context:
             self._log.info(f'ensuring transform caches... this might take a minute...')
             start = time.perf_counter()
             for name, transform in self._tf_map.items():
-                if transform.is_cached:
+                if transform.is_cached(ctx=self):
                     if not regen:
                         self._log.info(
                             f'transform cache for {name} found at '
@@ -160,7 +160,7 @@ class Context:
                     else:
                         transform.clear_cache()
 
-                if transform.is_cached:
+                if transform.is_cached(ctx=self):
                     continue
 
                 self._log.info(

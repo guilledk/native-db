@@ -17,6 +17,12 @@ class LambdaQuery(Protocol):
         ...
 
 
+@runtime_checkable
+class LambdaBoolQuery(Protocol):
+    def __call__(self, ctx: 'Context') -> bool:
+        ...
+
+
 class Transform:
     '''
     Declare a dataframe transform using a pl.LazyFrame, and a cache path and
@@ -34,11 +40,13 @@ class Transform:
         cache_format: FrameFormats = 'parquet',
         sink_args: dict[str, Any] = {},
         *,
+        primary_key: str | None = None,
         partition_by: list[str] | None = None,
         include_key: bool = False,
         per_partition_sort_by: list[str] | None = None,
         # Optional "prepare" to add derived partition columns (e.g., bucket)
         prepare: Callable | None = None,
+        is_cached: LambdaBoolQuery | None = None,
     ) -> None:
         self.name = name
         self.query = query
@@ -49,11 +57,15 @@ class Transform:
         self.include_key = include_key
         self.per_partition_sort_by = per_partition_sort_by or []
         self.prepare = prepare
+        self._is_cached = is_cached
+        self.primary_key = primary_key
 
         self._frame: pl.LazyFrame | None = None
 
-    @property
-    def is_cached(self) -> bool:
+    def is_cached(self, ctx: 'Context | None' = None) -> bool:
+        if self._is_cached:
+            return self._is_cached(ctx)
+
         return self.cache_path.exists()
 
     @property
@@ -76,7 +88,9 @@ class Transform:
         if use_cache and self._frame is not None:
             return self._frame
 
-        if not self.is_cached:
+        is_cached = self.is_cached(ctx)
+
+        if not is_cached:
             query = self.query
             if isinstance(query, LambdaQuery):
                 if not ctx:
@@ -120,9 +134,41 @@ class Transform:
                     shutil.rmtree(self.cache_path, ignore_errors=True)
                 os.replace(tmp_dir, self.cache_path)
             else:
-                # single-file cache (existing behavior)
-                res = sink_frame(lf, self.cache_path, format=self.cache_format, **self.sink_args)
-                _ = res.collect()
+                tmp_cache = self.cache_path.with_name(self.cache_path.name + ".tmp")
+                if tmp_cache.exists():
+                    import shutil; shutil.rmtree(tmp_cache, ignore_errors=True)
+                try:
+                    # check if cache exists in disk
+                    cached_lf = scan_frame(self.cache_path)
+                    cached_lf.collect()
+
+                    idx = self.primary_key
+                    new_rows_lf = (
+                        lf
+                        .join(
+                            cached_lf.select(idx),
+                            on=idx,
+                            how='left',
+                        )
+                    )
+                    lf = (
+                        pl.concat(
+                            (cached_lf, new_rows_lf),
+                            how='vertical',
+                            rechunk=False,
+                        )
+                        .unique(idx, maintain_order=True, keep='last')
+                    )
+
+                except FileNotFoundError:
+                    # cache not created yet
+                    pass
+
+                finally:
+                    res = sink_frame(lf, tmp_cache, format=self.cache_format, **self.sink_args)
+                    _ = res.collect()
+                    tmp_cache.rename(self.cache_path)
+
 
         # cache & return a lazy scan into the cache
         if self.partition_by:
