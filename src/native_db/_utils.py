@@ -2,17 +2,16 @@
 Misc internal utilities
 
 '''
-from contextlib import contextmanager
 import os
 
 from datetime import datetime, timezone
 from pathlib import Path
-import signal
-import threading
-import time
+import re
 
-import psutil
 import requests
+
+from hotbaud.experimental.flock import Lock
+from requests.structures import CaseInsensitiveDict
 
 
 class NativeDBWarning(Warning): ...
@@ -73,53 +72,68 @@ def solve_redirects(
     return url
 
 
+def _sanitize_cache_token(value: str) -> str:
+    value = value.strip().strip('"')
+    value = re.sub(r'[^A-Za-z0-9._-]+', '_', value)
+    return value
+
+
+def _remote_cache_key(headers: CaseInsensitiveDict) -> str:
+    etag = headers.get('ETag')
+    if etag:
+        if etag.startswith('W/'):
+            etag = etag[2:]
+        return f'etag-{_sanitize_cache_token(etag)}'
+
+    last_modified = headers.get('Last-Modified')
+    if last_modified:
+        return f'mtime-{_sanitize_cache_token(last_modified)}'
+
+    content_length = headers.get('Content-Length')
+    if content_length:
+        return f'len-{content_length}'
+
+    raise RuntimeError(f'Could not derive cache key from headers: {headers}')
+
+
 def fetch_remote_file(
     datadir: Path,
     url: str,
     *,
     prefix: str | None,
-    suffix: str | None
+    suffix: str | None,
 ) -> Path:
-    # perform head requests looking for ETag header with checksum
-    head = requests.head(url)
+    datadir.mkdir(exist_ok=True, parents=True)
 
-    # expect etag checksum
-    etag = head.headers.get('ETag')
-    if not etag:
-        raise RuntimeError(
-            f'Remote source head response missing etag header: {head.headers}'
-        )
+    with Lock(datadir / '.download_lock'):
+        head = requests.head(url, allow_redirects=True)
+        head.raise_for_status()
 
-    # maybe we got a "weak etag" which is prefixed by 'W/'
-    if etag.startswith('W/'):
-        etag = etag[2:]
+        cache_key = _remote_cache_key(head.headers)
 
-    # strip quotes
-    etag = etag.strip('"')
+        if not suffix:
+            url_no_params = url.split('?', 1)[0]
+            url_filename = url_no_params.rsplit('/', 1)[-1]
+            if '.' in url_filename:
+                suffix = url_filename.rsplit('.', 1)[-1]
+            else:
+                suffix = 'bin'
 
-    # maybe figure out prefix and suffix from url
-    if not suffix:
-        url_no_params = url.split('?')[0]
-        url_filename = url_no_params.split('/')[-1]
-        filename_parts = url_filename.split('.')
-        suffix = filename_parts[-1]
+        fname = f'{cache_key}.{suffix}'
+        if prefix:
+            fname = '-'.join((prefix, fname))
 
-    # finally generate etag based local cache path
-    fname = f'{etag}.{suffix}'
-    if prefix:
-        fname = '-'.join((prefix, fname))
+        local_path = datadir / fname
 
-    local_path = datadir / fname
+        if not local_path.is_file():
+            local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # if local file missing, attempt download
-    if not local_path.is_file():
-        local_path.parent.mkdir(parents=True, exist_ok=True)
+            resp = requests.get(url, allow_redirects=True, stream=True)
+            resp.raise_for_status()
 
-        resp = requests.get(url, allow_redirects=True, stream=True)
-        resp.raise_for_status()
+            with open(local_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=4 * 1024):
+                    if chunk:
+                        f.write(chunk)
 
-        with open(local_path, 'wb+') as f:
-            for chunk in resp.iter_content(chunk_size=4 * 1024):
-                f.write(chunk)
-
-    return local_path
+        return local_path
