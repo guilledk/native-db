@@ -5,6 +5,8 @@ import shutil
 from native_db.lowlevel.diskops import FrameFormats, sink_frame, scan_frame
 import polars as pl
 
+from polars.type_aliases import EngineType
+
 from native_db._utils import path_size
 
 if TYPE_CHECKING:
@@ -67,7 +69,12 @@ class Transform:
         else:
             self.cache_path.unlink(missing_ok=True)
 
-    def scan(self, ctx: 'Context | None' = None, use_cache: bool = True) -> pl.LazyFrame:
+    def scan(
+        self,
+        ctx: 'Context | None' = None,
+        use_cache: bool = True,
+        engine: EngineType = 'streaming'
+    ) -> pl.LazyFrame:
         '''
         Materialize transform to meta.local_path if not present already, then
         return a `pl.LazyFrame` to it.
@@ -113,16 +120,21 @@ class Transform:
                     **self.sink_args,
                 )
                 # execute streaming sink
-                _ = res.collect()
+                _ = res.collect(engine=engine)
                 # atomic-ish replace directory
                 import shutil, os
                 if self.cache_path.exists():
                     shutil.rmtree(self.cache_path, ignore_errors=True)
                 os.replace(tmp_dir, self.cache_path)
             else:
-                # single-file cache (existing behavior)
-                res = sink_frame(lf, self.cache_path, format=self.cache_format, **self.sink_args)
-                _ = res.collect()
+                 # single-file cache (existing behavior)
+                 res = sink_frame(
+                    lf,
+                    self.cache_path,
+                    format=self.cache_format,
+                    **self.sink_args
+                )
+                 _ = res.collect(engine=engine)
 
         # cache & return a lazy scan into the cache
         if self.partition_by:
